@@ -1,0 +1,41 @@
+/**
+ ******************************************************************************
+ * @file        lvgl_demo.h
+ * @version     V1.0
+ * @brief       lvgl_demo
+ ******************************************************************************
+ * @attention   Waiken-Smart 慧勤智远
+ * 
+ * 实验平台:     慧勤智远 ESP32-S3 开发板
+ ******************************************************************************
+ */
+ 
+#ifndef __LVGL_DEMO_H
+#define __LVGL_DEMO_H
+
+#include "lcd.h"
+#include "esp_timer.h"
+#include "lvgl.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "sdmmc_cmd.h"
+#include "spi_sd.h"
+#include "lv_camera_ui.h"
+#include "touch.h"
+#include "esp_dma_utils.h"
+#include "lv_start_ui.h"
+#include "lv_main_ui.h"
+#include "key.h"
+#include "usart.h"
+
+
+extern lv_disp_drv_t disp_drv;      /* 回调函数的参数 */
+extern lv_indev_data_t touch_data;
+
+/* 函数声明 */
+void lvgl_demo(void);
+void lvgl_mux_unlock(void);
+bool lvgl_mux_lock(int timeout_ms);
+void touchpad_get_xy(lv_coord_t *x, lv_coord_t *y);
+#endif

@@ -1,0 +1,12 @@
+build/
+managed_components/
+
+sdkconfig.old
+
+*.bin
+*.elf
+*.map
+*.log
+*.tmp
+
+.vscode/ipch/
