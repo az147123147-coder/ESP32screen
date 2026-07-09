@@ -1,6 +1,15 @@
-# ESP32-S3 3.5 寸触摸屏综合工程
+# ESP32-S3 3.5寸触摸屏综合工程
 
-基于商家 `synthesis_test` 工程整理和继续开发的 ESP32-S3 触摸屏工程，当前工程名为 `synthesis_TY`。工程使用 ESP-IDF + LVGL，主要功能包括主界面、相册、视频播放、WiFi、日历和时间同步等。
+本项目基于 [ESP32-S3-LVGL-Board](https://github.com/ConstStrings/ESP32-S3-LVGL-Board) 二次开发，
+适配 ESP32-S3 N16R8 3.5 寸电容触摸屏开发套件。
+
+工程使用 ESP-IDF + LVGL，当前工程名为 `synthesis`，主要功能包括主界面、相册、视频播放、WiFi、日历和网络时间同步等。
+
+## 来源说明
+
+- 上游开源项目：[ConstStrings/ESP32-S3-LVGL-Board](https://github.com/ConstStrings/ESP32-S3-LVGL-Board)
+- 适配硬件：慧勤智远 ESP32-S3 N16R8 3.5 寸电容触摸屏开发套件
+- 商品页面：[淘宝商品链接](https://item.taobao.com/item.htm?id=946264202563)
 
 ## 硬件
 
@@ -13,14 +22,19 @@
 ## 工程目录
 
 ```text
-synthesis_TY/
+synthesis/
 ├── components/          # BSP、LVGL、中间件和驱动组件
 ├── main/                # 应用代码
-├── managed_components/  # ESP-IDF 组件管理器生成目录，通常不提交
-├── build/               # 编译生成目录，通常不提交
+├── managed_components/  # ESP-IDF 组件管理器生成目录
+├── build/               # 编译生成目录
 ├── sdkconfig            # 当前工程配置
+├── sdkconfig.defaults   # 关键硬件配置默认值
 └── partitions-16MiB.csv # 分区表
 ```
+
+## 工程配置
+
+本工程当前目标芯片为 `esp32s3`，Flash 为 16MB，PSRAM 为 Octal 80MHz，CPU 主频为 240MHz，并使用 `partitions-16MiB.csv` 自定义分区表。
 
 ## SD 卡目录
 
@@ -80,4 +94,3 @@ SD:/
 - WiFi 支持扫描和连接。
 - WiFi 密码会保存到 NVS，下次连接同一热点时可复用。
 - 时间支持联网同步，并用于主界面和日历显示。
-

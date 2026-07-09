@@ -9,4 +9,4 @@ set(EXTRA_COMPONENT_DIRS components/Middlewares)
 add_compile_options(-fdiagnostics-color=always)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(synthesis_TY)
+project(synthesis)
