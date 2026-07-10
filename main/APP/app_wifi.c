@@ -50,6 +50,7 @@ static lv_obj_t *status_label = NULL;           /* 连接状态标签 */
 static TimerHandle_t status_timer = NULL;       /* 定时器句柄 */
 static bool status_shown = false;               /* 状态信息是否已显示标志 */
 static bool styles_initialized = false;
+static volatile uint32_t wifi_ui_generation = 0;
 
 /***************************** 样式定义 *******************************/
 static lv_style_t box_style;           /* 容器样式 */
@@ -87,18 +88,26 @@ typedef struct {
     esp_err_t err;
     uint16_t ap_count;
     wifi_ap_record_t *ap_list;
+    uint32_t generation;
 } wifi_scan_result_t;
 
 typedef struct {
     char ssid[33];
     char password[MAX_PASSWORD_LEN + 1];
     wifi_auth_mode_t authmode;
+    uint32_t generation;
 } wifi_connect_wait_t;
 
 typedef struct {
     bool success;
     char ssid[33];
+    uint32_t generation;
 } wifi_connect_result_t;
+
+typedef struct {
+    uint32_t generation;
+    char text[];
+} status_label_gen_t;
 
 /************************** 按钮定义 **************************/
 static const char *connect_btns[] = {"Connect", "Cancel", ""}; /* 连接对话框按钮 */
@@ -110,6 +119,7 @@ static void ap_free_event(lv_event_t *e);
 static void conn_box_delete_event(lv_event_t *e);
 static void show_connect_result(bool success, const char *ssid);
 static void async_update_status_label(const char *text);
+static void async_update_status_label_gen(const char *text, uint32_t generation);
 static void clear_status_label(TimerHandle_t xTimer);
 static void wifi_scan_handler(void);
 static bool wifi_start_sta(void);
@@ -287,76 +297,6 @@ static bool wifi_saved_remember(const char *ssid, const char *password, wifi_aut
 static void wifi_scan_handler(void) 
 {
     wifi_start_scan();
-    return;
-
-    if (esp_wifi_scan_start(NULL, true) != ESP_OK)
-    {
-        ESP_LOGE(TAG, "WiFi scan failed");
-        return;
-    }
-
-    uint16_t ap_count = 0;
-    wifi_ap_record_t *ap_list = NULL;
-    
-    esp_wifi_scan_get_ap_num(&ap_count);
-    if (ap_count == 0) 
-	{
-        ESP_LOGW(TAG, "No AP found");
-        return;
-    }
-    
-    ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
-    if (!ap_list) 
-	{
-        ESP_LOGE(TAG, "AP list malloc failed");
-        return;
-    }
-    
-    esp_err_t ret = esp_wifi_scan_get_ap_records(&ap_count, ap_list);
-    if (ret != ESP_OK) 
-	{
-        ESP_LOGE(TAG, "Get AP records failed: %s", esp_err_to_name(ret));
-        free(ap_list);
-        return;
-    }
-    
-    lv_obj_clean(wifi_ui.list);
-    
-    for (int i = 0; i < ap_count; i++) {
-        wifi_ap_record_t *ap_copy = malloc(sizeof(wifi_ap_record_t));
-        if (!ap_copy)
-        {
-            ESP_LOGE(TAG, "AP record malloc failed");
-            break;
-        }
-        memcpy(ap_copy, &ap_list[i], sizeof(wifi_ap_record_t));
-        
-        // 创建列表项容器
-        lv_obj_t *container = lv_obj_create(wifi_ui.list);
-        lv_obj_set_size(container, LV_PCT(100), 40);
-        lv_obj_set_flex_flow(container, LV_FLEX_FLOW_ROW);
-        lv_obj_set_style_bg_opa(container, LV_OPA_0, 0);
-        lv_obj_set_style_border_width(container, 0, 0);
-        lv_obj_set_style_pad_all(container, 5, 0);
-
-        // 添加信号强度图标
-        lv_obj_t *icon = lv_img_create(container);
-        lv_img_set_src(icon, get_wifi_icon(ap_copy->rssi));
-        lv_obj_set_size(icon, 24, 24);
-        lv_obj_set_align(icon, LV_ALIGN_LEFT_MID);
-
-        // 添加SSID标签
-        lv_obj_t *label = lv_label_create(container);
-        lv_label_set_text(label, (const char *)ap_copy->ssid);
-        lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
-		//lv_obj_set_style_text_font(label, &Font10WIFI, 0);  // 修改为Font10WIFI
-        lv_obj_set_style_pad_left(label, 10, 0);
-
-        // 添加点击事件
-        lv_obj_add_event_cb(container, wifi_connect_event, LV_EVENT_CLICKED, ap_copy);
-        lv_obj_add_event_cb(container, ap_free_event, LV_EVENT_DELETE, ap_copy);
-    }
-    free(ap_list);
 }
 
 static bool wifi_start_sta(void)
@@ -397,7 +337,7 @@ static bool wifi_start_scan(void)
     BaseType_t ret = xTaskCreatePinnedToCore(wifi_scan_task,
                                              "wifi_scan",
                                              WIFI_WORK_TASK_STACK,
-                                             NULL,
+                                             (void *)(uintptr_t)wifi_ui_generation,
                                              WIFI_WORK_TASK_PRIORITY,
                                              NULL,
                                              0);
@@ -413,7 +353,7 @@ static bool wifi_start_scan(void)
 
 static void wifi_scan_task(void *arg)
 {
-    (void)arg;
+    uint32_t generation = (uint32_t)(uintptr_t)arg;
 
     wifi_scan_result_t *result = calloc(1, sizeof(wifi_scan_result_t));
     if (result == NULL)
@@ -423,6 +363,7 @@ static void wifi_scan_task(void *arg)
         return;
     }
 
+    result->generation = generation;
     result->err = esp_wifi_scan_start(NULL, true);
     if (result->err == ESP_OK)
     {
@@ -462,7 +403,7 @@ static void wifi_scan_result_cb(void *arg)
         return;
     }
 
-    if (!wifi_ui_active || wifi_ui.list == NULL || !lv_obj_is_valid(wifi_ui.list))
+    if (!wifi_ui_active || wifi_ui.list == NULL || !lv_obj_is_valid(wifi_ui.list) || result->generation != wifi_ui_generation)
     {
         free(result->ap_list);
         free(result);
@@ -554,6 +495,7 @@ static void wifi_connect_wait_task(void *arg)
     if (result != NULL)
     {
         result->success = success;
+        result->generation = wait->generation;
         strncpy(result->ssid, wait->ssid, sizeof(result->ssid) - 1);
         if (lv_async_call(wifi_connect_result_cb, result) != LV_RES_OK)
         {
@@ -573,14 +515,19 @@ static void wifi_connect_wait_task(void *arg)
 static void wifi_connect_result_cb(void *arg)
 {
     wifi_connect_result_t *result = (wifi_connect_result_t *)arg;
+    bool is_current = false;
 
     if (result != NULL)
     {
-        show_connect_result(result->success, result->ssid);
+        is_current = wifi_ui_active && result->generation == wifi_ui_generation;
+        if (is_current)
+        {
+            show_connect_result(result->success, result->ssid);
+        }
         free(result);
     }
 
-    if (wifi_ui.conn_box && lv_obj_is_valid(wifi_ui.conn_box))
+    if (is_current && wifi_ui.conn_box && lv_obj_is_valid(wifi_ui.conn_box))
     {
         lv_msgbox_close(wifi_ui.conn_box);
     }
@@ -722,6 +669,7 @@ static void conn_btn_event(lv_event_t *e)
     strncpy(wait->ssid, (const char *)ap->ssid, sizeof(wait->ssid) - 1);
     strncpy(wait->password, pwd, sizeof(wait->password) - 1);
     wait->authmode = ap->authmode;
+    wait->generation = wifi_ui_generation;
 
     if (!wifi_start_sta())
     {
@@ -826,20 +774,29 @@ static const void* get_wifi_icon(int rssi)
  */
 static void async_update_status_label(const char *text) 
 {
-    if (status_label == NULL)
+    async_update_status_label_gen(text, wifi_ui_generation);
+}
+
+static void async_update_status_label_gen(const char *text, uint32_t generation)
+{
+    if (text == NULL)
     {
         return;
     }
 
-    char *text_copy = strdup(text ? text : "");
-    if (text_copy == NULL)
+    size_t text_len = strlen(text);
+    status_label_gen_t *update = malloc(sizeof(*update) + text_len + 1);
+    if (update == NULL)
     {
         return;
     }
 
-    if (lv_async_call(async_update_status_label_cb, text_copy) != LV_RES_OK)
+    update->generation = generation;
+    memcpy(update->text, text, text_len + 1);
+
+    if (lv_async_call(async_update_status_label_cb, update) != LV_RES_OK)
     {
-        free(text_copy);
+        free(update);
     }
 }
 
@@ -850,19 +807,25 @@ static void async_update_status_label(const char *text)
  */
 static void async_update_status_label_cb(void *arg) 
 {
-    char *text = (char *)arg;
-    if (text == NULL)
+    status_label_gen_t *update = (status_label_gen_t *)arg;
+    if (update == NULL)
     {
         return;
     }
 
-    bool is_connect_failed = strstr(text, "Connect Failed") != NULL;
+    if (!wifi_ui_active || update->generation != wifi_ui_generation)
+    {
+        free(update);
+        return;
+    }
+
+    bool is_connect_failed = strstr(update->text, "Connect Failed") != NULL;
     if (status_label && lv_obj_is_valid(status_label)) 
 	{
-        lv_label_set_text(status_label, text);
+        lv_label_set_text(status_label, update->text);
 		lv_obj_set_style_text_font(status_label, &Font10WIFI, 0);
     }
-    free(arg);
+    free(update);
 
     // 如果是连接失败的消息，则设置标志
     if (is_connect_failed) 
@@ -1086,6 +1049,7 @@ void wifi_app_init(void)
         wifi_app_del();                           /* 调用清理函数 */
     }
 
+    wifi_ui_generation++;
     wifi_ui_active = true;                        /* 标记界面为活跃状态 */
 
     /* 创建主容器 */
@@ -1192,12 +1156,13 @@ static void back_button_event(lv_event_t *e)
  */
 void wifi_app_del(void) 
 {
+    wifi_ui_active = false;
+    wifi_ui_generation++;
+
     if (wifi_ui.conn_box && lv_obj_is_valid(wifi_ui.conn_box))
     {
         lv_msgbox_close(wifi_ui.conn_box);
     }
-
-    wifi_ui_active = false;                       /* 标记界面为非活跃状态 */
 
     /* 解除全局应用对象绑定 */
     app_obj_general.APP_Function = NULL;          /* 清除回调函数指针 */
@@ -1230,12 +1195,7 @@ void wifi_app_del(void)
     /* 恢复主界面显示 */
     lv_display_box();                             /* 显示主界面（自定义函数） */
 
-    /* 重置LVGL焦点组 */
-    lv_group_t *group = lv_group_get_default();   /* 获取默认焦点组 */
-    if(group) lv_group_remove_all_objs(group);    /* 移除所有焦点对象 */
-
-    /* 清空状态标签 */
-    async_update_status_label("");
+    status_shown = false;
 
     // 删除定时器
     if (status_timer != NULL) 

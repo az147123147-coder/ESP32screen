@@ -21,6 +21,7 @@
 #include "mjpeg.h"
 #include "sdmmc_cmd.h"
 #include "esptim.h"
+#include "spi_sd.h"
 
 #define AVI_MAX_FRAME_SIZE  60 * 1024
 
@@ -74,6 +75,7 @@ typedef struct
     uint16_t AudioBufSize;
     uint16_t AudioType;
     uint16_t StreamID;
+    uint32_t StreamDataSize;
     uint32_t StreamSize;
     char *VideoFLAG;
     char *AudioFLAG;
@@ -217,5 +219,5 @@ typedef struct
 /* 函数声明 */
 void lv_video_ui(void);
 void lv_video_del(void);
-uint32_t avi_srarch_id(uint8_t *buf, uint32_t size, char *id);
+uint32_t avi_srarch_id(uint8_t *buf, uint32_t size, const char *id);
 #endif

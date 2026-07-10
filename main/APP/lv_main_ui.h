@@ -101,6 +101,7 @@ typedef struct
     del_app_t app_state;
     void (*Function)(void);
     void (*APP_Function)(void);
+    volatile uint8_t requires_sd;
 } lv_m_general_t;
 
 extern lv_m_general_t app_obj_general;
@@ -114,4 +115,6 @@ void lv_display_box(void);
 void lv_smail_icon_add_state(small_icon_state_t state);
 void lv_smail_icon_clear_state(small_icon_state_t state);
 uint8_t lv_smail_icon_get_state(small_icon_state_t state);
+void lv_focus_restore(void);
+void lv_mem_log(void);
 #endif

@@ -17,6 +17,7 @@
 #include "ff.h"
 #include "lvgl.h"
 #include "lv_main_ui.h"
+#include "spi_sd.h"
 
 #define FILE_PATH_SIZE 256
 #define FILE_PATH_DEPTH 16
@@ -29,6 +30,7 @@ typedef struct
     lv_obj_t * list;          /* 列表控件 */
     lv_obj_t *lv_page_obj;    /* 定义标题的对象 */
     lv_obj_t * list_btn[LIST_SIZE]; /* 定义列表按键数量 */
+    BYTE list_attr[LIST_SIZE];
     uint8_t list_flie_nuber;  /* 存储文本夹和文件的数量 */
     FRESULT fr;                 /* 读文件返回值 */
     FF_DIR lv_dir;              /* 读取的目录 */

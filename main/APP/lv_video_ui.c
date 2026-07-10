@@ -13,8 +13,10 @@
 #include "lv_video_ui.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 
 // const char* TAG1 = "main";
@@ -56,10 +58,25 @@ static uint32_t video_buf_h = 0;
 static lv_obj_t *video_back_btn = NULL;
 static uint8_t video_closing = 0;
 static volatile video_stat_t video_pending_key = VIDEO_NULL;
+static bool video_sd_session = false;
+static lv_timer_t *video_close_timer = NULL;
+static int64_t video_frame_start = 0;
+bool video_touch_mirrored = false;
+static void video_finish_close(void);
+static void video_close_timer_cb(lv_timer_t *timer);
 #define VIDEO_DIRECT_LCD_DRAW 0
 #define VIDEO_LANDSCAPE_FLIPPED 1
 #define VIDEO_READ_RETRY_MAX 3
 #define VIDEO_READ_RETRY_DELAY_MS 3
+
+static void video_sd_session_release(void)
+{
+    if (video_sd_session)
+    {
+        video_sd_session = false;
+        sd_local_session_end();
+    }
+}
 
 static void video_sd_lost(void)
 {
@@ -82,18 +99,15 @@ static uint8_t video_file_read(FIL *fp, void *buf, UINT btr, UINT *br)
     for (uint8_t retry = 0; retry < VIDEO_READ_RETRY_MAX; retry++)
     {
         *read_len = 0;
-        SD_CS(0);
         if (retry > 0)
         {
-            res = (uint8_t)f_lseek(fp, start_pos);
+            res = (uint8_t)sd_f_lseek(fp, start_pos);
             if (res != FR_OK)
             {
-                SD_CS(1);
                 return res;
             }
         }
-        res = (uint8_t)f_read(fp, buf, btr, read_len);
-        SD_CS(1);
+        res = (uint8_t)sd_f_read(fp, buf, btr, read_len);
 
         if (res == FR_OK)
         {
@@ -143,9 +157,15 @@ static void video_set_display_dir(uint8_t dir, uint8_t flipped)
     if ((dir == 1) && flipped)
     {
         esp_lcd_panel_mirror(panel_handle, true, true);
+        video_touch_mirrored = true;
+    }
+    else
+    {
+        video_touch_mirrored = false;
     }
 #else
     (void)flipped;
+    video_touch_mirrored = false;
 #endif
     disp_drv.hor_res = lcd_dev.width;
     disp_drv.ver_res = lcd_dev.height;
@@ -173,7 +193,6 @@ static void video_back_event_handler(lv_event_t *event)
 
     if (code == LV_EVENT_LONG_PRESSED && video_closing == 0)
     {
-        video_closing = 1;
         lv_video_del();
     }
 }
@@ -272,191 +291,213 @@ static uint8_t video_direct_draw(uint32_t w, uint32_t h, uint8_t *video_buf)
  *    @arg      OK,avi文件解析成功
  *    @arg      其他,错误代码
  */
-AVISTATUS avi_init(uint8_t *buf, uint32_t size)
+static bool avi_read_at(const uint8_t *buf, uint32_t size, uint32_t offset, void *value, size_t value_size)
 {
-    uint16_t offset;
-    uint8_t *tbuf;
-    AVISTATUS res = AVI_OK;
-    AVI_HEADER *aviheader;
-    LIST_HEADER *listheader;
-    AVIH_HEADER *avihheader;
-    STRH_HEADER *strhheader;
-
-    STRF_BMPHEADER *bmpheader;
-    STRF_WAVHEADER *wavheader;
-
-    tbuf = buf;
-    aviheader = (AVI_HEADER *)buf;
-    if (aviheader->RiffID != AVI_RIFF_ID)
+    if (buf == NULL || value == NULL || offset > size || value_size > size - offset)
     {
-        return AVI_RIFF_ERR;        /* RIFF ID错误 */
+        return false;
     }
 
-    if (aviheader->AviID != AVI_AVI_ID)
+    memcpy(value, buf + offset, value_size);
+    return true;
+}
+
+static bool avi_chunk_bounds(uint32_t offset, uint32_t block_size, uint32_t limit, uint32_t *data_end, uint32_t *next_offset)
+{
+    uint64_t end = (uint64_t)offset + 8u + block_size;
+    uint64_t next = end + (block_size & 1u);
+
+    if (end > limit || next > limit)
     {
-        return AVI_AVI_ERR;         /* AVI ID错误 */
+        return false;
     }
 
-    buf += sizeof(AVI_HEADER);      /* 偏移 */
-    listheader = (LIST_HEADER *)(buf);
-    if (listheader->ListID != AVI_LIST_ID)
+    if (data_end != NULL)
     {
-        return AVI_LIST_ERR;        /* LIST ID错误 */
+        *data_end = (uint32_t)end;
+    }
+    if (next_offset != NULL)
+    {
+        *next_offset = (uint32_t)next;
     }
 
-    if (listheader->ListType != AVI_HDRL_ID)
+    return true;
+}
+
+static AVISTATUS avi_parse_stream_list(const uint8_t *buf, uint32_t limit, uint32_t offset, uint32_t *next_offset, uint32_t *stream_type)
+{
+    LIST_HEADER listheader;
+    STRH_HEADER strhheader;
+    uint32_t list_end;
+    uint32_t strf_offset;
+    uint32_t strf_header[2];
+
+    if (!avi_read_at(buf, limit, offset, &listheader, sizeof(listheader)))
     {
-        return AVI_HDRL_ERR;        /* HDRL ID错误 */
+        return AVI_LIST_ERR;
+    }
+    if (listheader.ListID != AVI_LIST_ID || listheader.ListType != AVI_STRL_ID || listheader.BlockSize < 4)
+    {
+        return AVI_STRL_ERR;
+    }
+    if (!avi_chunk_bounds(offset, listheader.BlockSize, limit, &list_end, next_offset))
+    {
+        return AVI_STRL_ERR;
     }
 
-    buf += sizeof(LIST_HEADER);     /* 偏移 */
-    avihheader = (AVIH_HEADER *)(buf);
-    if (avihheader->BlockID != AVI_AVIH_ID)
+    uint32_t strh_offset = offset + sizeof(LIST_HEADER);
+    if (!avi_read_at(buf, list_end, strh_offset, &strhheader, sizeof(strhheader)))
     {
-        return AVI_AVIH_ERR;        /* AVIH ID错误 */
+        return AVI_STRH_ERR;
+    }
+    if (strhheader.BlockID != AVI_STRH_ID || strhheader.BlockSize < sizeof(STRH_HEADER) - 8)
+    {
+        return AVI_STRH_ERR;
+    }
+    if (!avi_chunk_bounds(strh_offset, strhheader.BlockSize, list_end, NULL, &strf_offset))
+    {
+        return AVI_STRH_ERR;
+    }
+    if (!avi_read_at(buf, list_end, strf_offset, strf_header, sizeof(strf_header)) || strf_header[0] != AVI_STRF_ID)
+    {
+        return AVI_STRF_ERR;
+    }
+    if (!avi_chunk_bounds(strf_offset, strf_header[1], list_end, NULL, NULL))
+    {
+        return AVI_STRF_ERR;
     }
 
-    g_avix.SecPerFrame = avihheader->SecPerFrame;   /* 得到帧间隔时间 */
-    g_avix.TotalFrame = avihheader->TotalFrame;     /* 得到总帧数 */
-    buf += avihheader->BlockSize + 8;               /* 偏移 */
-    listheader = (LIST_HEADER *)(buf);
-    if (listheader->ListID != AVI_LIST_ID)
+    if (strhheader.StreamType == AVI_VIDS_STREAM)
     {
-        return AVI_LIST_ERR;        /* LIST ID错误 */
-    }
+        STRF_BMPHEADER bmpheader = {0};
+        size_t bmpheader_size = offsetof(STRF_BMPHEADER, bmColors);
 
-    if (listheader->ListType != AVI_STRL_ID)
-    {
-        return AVI_STRL_ERR;        /* STRL ID错误 */
-    }
-
-    strhheader = (STRH_HEADER *)(buf + 12);
-    if (strhheader->BlockID != AVI_STRH_ID)
-    {
-        return AVI_STRH_ERR;        /* STRH ID错误 */
-    }
-
-    if (strhheader->StreamType == AVI_VIDS_STREAM)  /* 视频帧在前 */
-    {
-        if (strhheader->Handler != AVI_FORMAT_MJPG) /* 非MJPG视频流,不支持 */
+        if (strf_header[1] < sizeof(BMP_HEADER) || !avi_read_at(buf, list_end, strf_offset, &bmpheader, bmpheader_size))
+        {
+            return AVI_STRF_ERR;
+        }
+        if (strhheader.Handler != AVI_FORMAT_MJPG || bmpheader.bmiHeader.Compression != AVI_FORMAT_MJPG)
+        {
+            return AVI_FORMAT_ERR;
+        }
+        if (bmpheader.bmiHeader.Width <= 0 || bmpheader.bmiHeader.Height <= 0 ||
+            bmpheader.bmiHeader.Width > LV_COORD_MAX || bmpheader.bmiHeader.Height > LV_COORD_MAX)
         {
             return AVI_FORMAT_ERR;
         }
 
-        g_avix.VideoFLAG = AVI_VIDS_FLAG_TBL[0];    /* 视频流标记  "00dc" */
-        g_avix.AudioFLAG = AVI_AUDS_FLAG_TBL[1];    /* 音频流标记  "01wb" */
-        bmpheader = (STRF_BMPHEADER *)(buf + 12 + strhheader->BlockSize + 8);   /* strf */
-        if (bmpheader->BlockID != AVI_STRF_ID)
-        {
-            return AVI_STRF_ERR;    /* STRF ID错误 */
-        }
-
-        g_avix.Width = bmpheader->bmiHeader.Width;
-        g_avix.Height = bmpheader->bmiHeader.Height;
-        buf += listheader->BlockSize + 8;       /* 偏移 */
-        listheader = (LIST_HEADER *)(buf);
-        if (listheader->ListID != AVI_LIST_ID)  /* 是不含有音频帧的视频文件 */
-        {
-            g_avix.SampleRate = 0;              /* 音频采样率 */
-            g_avix.Channels = 0;                /* 音频通道数 */
-            g_avix.AudioType = 0;               /* 音频格式 */
-        }
-        else
-        {
-            if (listheader->ListType != AVI_STRL_ID)
-            {
-                return AVI_STRL_ERR;    /* STRL ID错误 */
-            }
-
-            strhheader = (STRH_HEADER *)(buf + 12);
-            if (strhheader->BlockID != AVI_STRH_ID)
-            {
-                return AVI_STRH_ERR;    /* STRH ID错误 */
-            }
-
-            if (strhheader->StreamType != AVI_AUDS_STREAM)
-            {
-                return AVI_FORMAT_ERR;  /* 格式错误 */
-            }
-
-            wavheader = (STRF_WAVHEADER *)(buf + 12 + strhheader->BlockSize + 8);   /* strf */
-            if (wavheader->BlockID != AVI_STRF_ID)
-            {
-                return AVI_STRF_ERR;    /* STRF ID错误 */
-            }
-
-            g_avix.SampleRate = wavheader->SampleRate;      /* 音频采样率 */
-            g_avix.Channels = wavheader->Channels;          /* 音频通道数 */
-            g_avix.AudioType = wavheader->FormatTag;        /* 音频格式 */
-        }
+        g_avix.Width = (uint32_t)bmpheader.bmiHeader.Width;
+        g_avix.Height = (uint32_t)bmpheader.bmiHeader.Height;
     }
-    else if (strhheader->StreamType == AVI_AUDS_STREAM)     /* 音频帧在前 */
-    { 
-        g_avix.VideoFLAG = AVI_VIDS_FLAG_TBL[1];            /* 视频流标记  "01dc" */
-        g_avix.AudioFLAG = AVI_AUDS_FLAG_TBL[0];            /* 音频流标记  "00wb" */
-        wavheader = (STRF_WAVHEADER *)(buf + 12 + strhheader->BlockSize + 8);   /* strf */
-        if (wavheader->BlockID != AVI_STRF_ID)
-        {
-            return AVI_STRF_ERR;                            /* STRF ID错误 */
-        }
- 
-        g_avix.SampleRate = wavheader->SampleRate;          /* 音频采样率 */
-        g_avix.Channels = wavheader->Channels;              /* 音频通道数 */
-        g_avix.AudioType = wavheader->FormatTag;            /* 音频格式 */
-        buf += listheader->BlockSize + 8;                   /* 偏移 */
-        listheader = (LIST_HEADER *)(buf);
-        if (listheader->ListID != AVI_LIST_ID)
-        {
-            return AVI_LIST_ERR;    /* LIST ID错误 */
-        }
-
-        if (listheader->ListType != AVI_STRL_ID)
-        {
-            return AVI_STRL_ERR;    /* STRL ID错误 */
-        }
-
-        strhheader = (STRH_HEADER *)(buf + 12);
-        if (strhheader->BlockID != AVI_STRH_ID)
-        {
-            return AVI_STRH_ERR;    /* STRH ID错误 */
-        }
-
-        if (strhheader->StreamType != AVI_VIDS_STREAM)
-        {
-            return AVI_FORMAT_ERR;  /* 格式错误 */
-        }
-
-        bmpheader = (STRF_BMPHEADER *)(buf + 12 + strhheader->BlockSize + 8);   /* strf */
-        if (bmpheader->BlockID != AVI_STRF_ID)
-        {
-            return AVI_STRF_ERR;    /* STRF ID错误 */
-        }
-
-        if (bmpheader->bmiHeader.Compression != AVI_FORMAT_MJPG)
-        {
-            return AVI_FORMAT_ERR;  /* 格式错误 */
-        }
-
-        g_avix.Width = bmpheader->bmiHeader.Width;
-        g_avix.Height = bmpheader->bmiHeader.Height;
-    }
-
-    offset = avi_srarch_id(tbuf, size, "movi");     /* 查找movi ID */
-    if (offset == 0)
+    else if (strhheader.StreamType == AVI_AUDS_STREAM)
     {
-        return AVI_MOVI_ERR;        /* MOVI ID错误 */
+        STRF_WAVHEADER wavheader;
+
+        if (strf_header[1] < sizeof(STRF_WAVHEADER) - 8 || !avi_read_at(buf, list_end, strf_offset, &wavheader, sizeof(wavheader)))
+        {
+            return AVI_STRF_ERR;
+        }
+
+        g_avix.SampleRate = wavheader.SampleRate;
+        g_avix.Channels = wavheader.Channels;
+        g_avix.AudioType = wavheader.FormatTag;
+    }
+    else
+    {
+        return AVI_FORMAT_ERR;
     }
 
-    if (g_avix.SampleRate)          /* 有音频流,才查找 */
+    *stream_type = strhheader.StreamType;
+    return AVI_OK;
+}
+
+AVISTATUS avi_init(uint8_t *buf, uint32_t size)
+{
+    AVI_HEADER aviheader;
+    LIST_HEADER listheader;
+    AVIH_HEADER avihheader;
+    uint32_t hdrl_end;
+    uint32_t stream_offset;
+    uint32_t next_stream_offset;
+    uint32_t first_stream_type;
+    uint32_t second_stream_type;
+
+    memset(&g_avix, 0, sizeof(g_avix));
+
+    if (!avi_read_at(buf, size, 0, &aviheader, sizeof(aviheader)) || aviheader.RiffID != AVI_RIFF_ID)
     {
-        tbuf += offset;
-        offset = avi_srarch_id(tbuf, size, g_avix.AudioFLAG);   /* 查找音频流标记 */
-        if (offset == 0)
+        return AVI_RIFF_ERR;
+    }
+    if (aviheader.AviID != AVI_AVI_ID)
+    {
+        return AVI_AVI_ERR;
+    }
+    if (!avi_read_at(buf, size, sizeof(AVI_HEADER), &listheader, sizeof(listheader)) || listheader.ListID != AVI_LIST_ID)
+    {
+        return AVI_LIST_ERR;
+    }
+    if (listheader.ListType != AVI_HDRL_ID || listheader.BlockSize < 4 ||
+        !avi_chunk_bounds(sizeof(AVI_HEADER), listheader.BlockSize, size, &hdrl_end, NULL))
+    {
+        return AVI_HDRL_ERR;
+    }
+
+    uint32_t avih_offset = sizeof(AVI_HEADER) + sizeof(LIST_HEADER);
+    if (!avi_read_at(buf, hdrl_end, avih_offset, &avihheader, sizeof(avihheader)) ||
+        avihheader.BlockID != AVI_AVIH_ID || avihheader.BlockSize < sizeof(AVIH_HEADER) - 8)
+    {
+        return AVI_AVIH_ERR;
+    }
+    if (!avi_chunk_bounds(avih_offset, avihheader.BlockSize, hdrl_end, NULL, &stream_offset))
+    {
+        return AVI_AVIH_ERR;
+    }
+
+    g_avix.SecPerFrame = avihheader.SecPerFrame;
+    g_avix.TotalFrame = avihheader.TotalFrame;
+
+    AVISTATUS status = avi_parse_stream_list(buf, hdrl_end, stream_offset, &next_stream_offset, &first_stream_type);
+    if (status != AVI_OK)
+    {
+        return status;
+    }
+
+    if (first_stream_type == AVI_VIDS_STREAM)
+    {
+        g_avix.VideoFLAG = AVI_VIDS_FLAG_TBL[0];
+        g_avix.AudioFLAG = AVI_AUDS_FLAG_TBL[1];
+
+        if (hdrl_end >= sizeof(LIST_HEADER) && next_stream_offset <= hdrl_end - sizeof(LIST_HEADER) &&
+            avi_read_at(buf, hdrl_end, next_stream_offset, &listheader, sizeof(listheader)) &&
+            listheader.ListID == AVI_LIST_ID)
         {
-            return AVI_STREAM_ERR;
+            status = avi_parse_stream_list(buf, hdrl_end, next_stream_offset, NULL, &second_stream_type);
+            if (status != AVI_OK || second_stream_type != AVI_AUDS_STREAM)
+            {
+                return status != AVI_OK ? status : AVI_FORMAT_ERR;
+            }
         }
-        tbuf += offset + 4;
-        g_avix.AudioBufSize = *((uint16_t *)tbuf);              /* 得到音频流buf大小. */
+    }
+    else
+    {
+        g_avix.VideoFLAG = AVI_VIDS_FLAG_TBL[1];
+        g_avix.AudioFLAG = AVI_AUDS_FLAG_TBL[0];
+        status = avi_parse_stream_list(buf, hdrl_end, next_stream_offset, NULL, &second_stream_type);
+        if (status != AVI_OK || second_stream_type != AVI_VIDS_STREAM)
+        {
+            return status != AVI_OK ? status : AVI_FORMAT_ERR;
+        }
+    }
+
+    if (g_avix.Width == 0 || g_avix.Height == 0)
+    {
+        return AVI_FORMAT_ERR;
+    }
+
+    uint32_t movi_offset = avi_srarch_id(buf, size, "movi");
+    if (movi_offset == 0)
+    {
+        return AVI_MOVI_ERR;
     }
 
     ESP_LOGI(TAG, "avi init ok\r\n");
@@ -471,7 +512,7 @@ AVISTATUS avi_init(uint8_t *buf, uint32_t size)
     ESP_LOGI(TAG, "g_avix.VideoFLAG:%s\r\n", g_avix.VideoFLAG);
     ESP_LOGI(TAG, "g_avix.AudioFLAG:%s\r\n", g_avix.AudioFLAG);
 
-    return res;
+    return AVI_OK;
 }
 
 /**
@@ -483,21 +524,21 @@ AVISTATUS avi_init(uint8_t *buf, uint32_t size)
  *   @arg       0     , 没找到
  *   @arg       其他  , movi ID偏移量
  */
-uint32_t avi_srarch_id(uint8_t *buf, uint32_t size, char *id)
+uint32_t avi_srarch_id(uint8_t *buf, uint32_t size, const char *id)
 {
-    uint32_t i;
-    uint32_t idsize = 0;
-    size -= 4;
-    for (i = 0; i < size; i++)
+    if (buf == NULL || id == NULL || size < 8)
+    {
+        return 0;
+    }
+
+    for (uint32_t i = 0; i <= size - 8; i++)
     {
         if ((buf[i] == id[0]) &&
             (buf[i + 1] == id[1]) &&
             (buf[i + 2] == id[2]) &&
             (buf[i + 3] == id[3]))
         {
-            idsize = MAKEDWORD(buf + i + 4);    /* 得到帧大小,必须大于16字节,才返回,否则不是有效数据 */
-
-            if (idsize > 0X10)return i;         /* 找到"id"所在的位置 */
+            return i;
         }
     }
 
@@ -511,18 +552,25 @@ uint32_t avi_srarch_id(uint8_t *buf, uint32_t size, char *id)
  *   @arg       AVI_OK, AVI文件解析成功
  *   @arg       其他  , 错误代码
  */
-AVISTATUS avi_get_streaminfo(uint8_t *buf)
+AVISTATUS avi_get_streaminfo(uint8_t *buf, uint32_t size)
 {
-    g_avix.StreamID = MAKEWORD(buf + 2);    /* 得到流类型 */
-    g_avix.StreamSize = MAKEDWORD(buf + 4); /* 得到流大小 */
-
-    if (g_avix.StreamSize > (AVI_MAX_FRAME_SIZE - 8)) /* 帧大小太大了,直接返回错误 */
+    if (buf == NULL || size < 8)
     {
-        printf("FRAME SIZE OVER:%ld\r\n", g_avix.StreamSize);
+        return AVI_STREAM_ERR;
+    }
+
+    g_avix.StreamID = MAKEWORD(buf + 2);    /* 得到流类型 */
+    g_avix.StreamDataSize = MAKEDWORD(buf + 4);
+
+    if (g_avix.StreamDataSize == 0 || g_avix.StreamDataSize > (AVI_MAX_FRAME_SIZE - 8)) /* 帧大小太大了,直接返回错误 */
+    {
+        printf("FRAME SIZE OVER:%ld\r\n", g_avix.StreamDataSize);
+        g_avix.StreamDataSize = 0;
         g_avix.StreamSize = 0;
         return AVI_STREAM_ERR;
     }
-    
+
+    g_avix.StreamSize = g_avix.StreamDataSize;
     if (g_avix.StreamSize % 2)
     {
         g_avix.StreamSize++;    /* 奇数加1(g_avix.StreamSize,必须是偶数) */
@@ -643,9 +691,7 @@ static uint8_t video_dir_open_retry(FF_DIR *dir, const TCHAR *path)
 
     for (uint8_t retry = 0; retry < VIDEO_READ_RETRY_MAX; retry++)
     {
-        SD_CS(0);
-        res = (uint8_t)f_opendir(dir, path);
-        SD_CS(1);
+        res = (uint8_t)sd_f_opendir(dir, path);
 
         if (res == FR_OK)
         {
@@ -664,13 +710,19 @@ static uint8_t video_dir_seek_read_retry(FF_DIR *dir, DWORD ofs, FILINFO *info)
 
     for (uint8_t retry = 0; retry < VIDEO_READ_RETRY_MAX; retry++)
     {
-        SD_CS(0);
-        res = (uint8_t)atk_video_dir_sdi(dir, ofs);
-        if (res == FR_OK)
+        if (!sd_access_begin(portMAX_DELAY))
         {
-            res = (uint8_t)f_readdir(dir, info);
+            res = FR_NOT_READY;
         }
-        SD_CS(1);
+        else
+        {
+            res = (uint8_t)atk_video_dir_sdi(dir, ofs);
+            if (res == FR_OK)
+            {
+                res = (uint8_t)f_readdir(dir, info);
+            }
+            sd_access_end();
+        }
 
         if (res == FR_OK)
         {
@@ -689,9 +741,7 @@ static uint8_t video_file_open_retry(FIL *fp, const TCHAR *path)
 
     for (uint8_t retry = 0; retry < VIDEO_READ_RETRY_MAX; retry++)
     {
-        SD_CS(0);
-        res = (uint8_t)f_open(fp, path, FA_READ);
-        SD_CS(1);
+        res = (uint8_t)sd_f_open(fp, path, FA_READ);
 
         if (res == FR_OK)
         {
@@ -710,9 +760,7 @@ static uint8_t video_file_lseek_retry(FIL *fp, FSIZE_t ofs)
 
     for (uint8_t retry = 0; retry < VIDEO_READ_RETRY_MAX; retry++)
     {
-        SD_CS(0);
-        res = (uint8_t)f_lseek(fp, ofs);
-        SD_CS(1);
+        res = (uint8_t)sd_f_lseek(fp, ofs);
 
         if (res == FR_OK)
         {
@@ -731,16 +779,46 @@ lv_img_dsc_t video_img_dsc = {
     .data = NULL,
 };
 
+static bool video_detach_image(int timeout_ms)
+{
+    if (lvgl_mux_lock(timeout_ms))
+    {
+        if (video_cfig.video_obj_t.video_img != NULL && lv_obj_is_valid(video_cfig.video_obj_t.video_img))
+        {
+            lv_obj_add_flag(video_cfig.video_obj_t.video_img, LV_OBJ_FLAG_HIDDEN);
+            lv_img_set_src(video_cfig.video_obj_t.video_img, NULL);
+        }
+        video_img_dsc.data = NULL;
+        video_img_ready = 0;
+        video_img_w = 0;
+        video_img_h = 0;
+        lvgl_mux_unlock();
+        return true;
+    }
+    return false;
+}
+
 /**
  * @brief       video显示视频
  * @param       无
  * @retval      无
  */
-void video_show(uint32_t w,uint32_t h,uint8_t * video_buf)
+static uint8_t video_show(uint32_t w,uint32_t h,uint8_t * video_buf)
 {
+    if (video_buf == NULL || w == 0 || h == 0 || w > LV_COORD_MAX || h > LV_COORD_MAX ||
+        w > SIZE_MAX / h || w * h > SIZE_MAX / 2)
+    {
+        return 0;
+    }
+
+    uint8_t displayed = 0;
     if (lvgl_mux_lock(10))
     {
-        if (video_direct_draw(w, h, video_buf) == 0)
+        if (video_direct_draw(w, h, video_buf) != 0)
+        {
+            displayed = 1;
+        }
+        else if (video_cfig.video_obj_t.video_img != NULL && lv_obj_is_valid(video_cfig.video_obj_t.video_img))
         {
             video_img_dsc.header.w = w;
             video_img_dsc.header.h = h;
@@ -759,10 +837,12 @@ void video_show(uint32_t w,uint32_t h,uint8_t * video_buf)
             {
                 lv_obj_invalidate(video_cfig.video_obj_t.video_img);
             }
+            lv_obj_clear_flag(video_cfig.video_obj_t.video_img, LV_OBJ_FLAG_HIDDEN);
+            displayed = 1;
         }
         lvgl_mux_unlock();
     }
-    //video_time_show(video_favi, &g_avix);
+    return displayed;
 }
 
 /**
@@ -777,12 +857,12 @@ void video(void *pvParameters)
     uint8_t key = 0;
     DWORD temp = 0;
     uint8_t *pbuf = NULL;
-    uint32_t nr = 0;
-    uint16_t offset = 0;
+    UINT nr = 0;
+    uint32_t offset = 0;
     uint8_t vdir_open = 0;
     uint8_t video_file_open = 0;
     uint8_t mjpeg_open = 0;
-    uint8_t read_fail_count = 0;
+    uint16_t unplayable_count = 0;
 
     res = video_dir_open_retry(&vdir, "0:/VIDEO");          /* 打开目录 */
 
@@ -827,10 +907,8 @@ void video(void *pvParameters)
 
         if (vdir_open)
         {
-            SD_CS(0);
-            f_closedir(&vdir);
+            sd_f_closedir(&vdir);
             vdir_open = 0;
-            SD_CS(1);
         }
 
         totavinum = video_curindex;
@@ -856,6 +934,9 @@ void video(void *pvParameters)
         while (video_cfig.video_start && res == FR_OK)
         {
             key = 0;
+            bool file_frame_shown = false;
+            bool automatic_advance = false;
+            video_frame_start = 0;
             res = video_dir_seek_read_retry(&vdir, voffsettbl[video_curindex], vfileinfo);   /* 改变当前目录索引 */
 
             if ((res != 0) || (vfileinfo->fname[0] == 0))           /* 错误或到末尾，退出 */
@@ -884,7 +965,7 @@ void video(void *pvParameters)
             {
                 video_file_open = 1;
                 pbuf = framebuf;
-                res = video_file_read(video_favi, pbuf, AVI_MAX_FRAME_SIZE, (UINT*)&nr);    /* 开始读取 */
+                res = video_file_read(video_favi, pbuf, AVI_MAX_FRAME_SIZE, &nr);    /* 开始读取 */
                 if (res != 0)
                 {
                     printf("fread error:%d\r\n", res);
@@ -892,19 +973,21 @@ void video(void *pvParameters)
                     goto video_file_cleanup;
                 }
 
-                res = avi_init(pbuf, AVI_MAX_FRAME_SIZE);                           /* AVI解析 */
+                res = avi_init(pbuf, nr);                           /* AVI解析 */
 
                 if (res != 0)
                 {
                     printf("avi error:%d\r\n", res);
                     key = VIDEO_NEXT;
+                    automatic_advance = true;
                     goto video_file_cleanup;
                 }
 
-                offset = avi_srarch_id(pbuf, AVI_MAX_FRAME_SIZE, "movi");   /* 寻找movi ID */
-                if (avi_get_streaminfo(pbuf + offset + 4) != 0)             /* 获取流信息 */
+                offset = avi_srarch_id(pbuf, nr, "movi");   /* 寻找movi ID */
+                if (nr < 12 || offset == 0 || offset > nr - 12 || avi_get_streaminfo(pbuf + offset + 4, nr - offset - 4) != 0)             /* 获取流信息 */
                 {
                     key = VIDEO_NEXT;
+                    automatic_advance = true;
                     goto video_file_cleanup;
                 }
                 res = video_file_lseek_retry(video_favi, offset + 12);      /* 跳过标志ID，读地址偏移到流数据开始处 */
@@ -919,6 +1002,7 @@ void video(void *pvParameters)
                 {
                     printf("mjpegdec Fail\r\n");
                     key = VIDEO_NEXT;
+                    automatic_advance = true;
                     goto video_file_cleanup;
                 }
                 mjpeg_open = 1;
@@ -932,6 +1016,12 @@ void video(void *pvParameters)
                     {
                         if (video_buf != NULL)
                         {
+                            if (!video_detach_image(100))
+                            {
+                                key = VIDEO_NEXT;
+                                automatic_advance = true;
+                                goto video_file_cleanup;
+                            }
                             mjpegdec_video_free();
                             video_buf_w = 0;
                             video_buf_h = 0;
@@ -955,6 +1045,7 @@ void video(void *pvParameters)
                 {
                     printf("video buf malloc failed\r\n");
                     key = VIDEO_NEXT;
+                    automatic_advance = true;
                     goto video_file_cleanup;
                 }
 
@@ -977,39 +1068,49 @@ void video(void *pvParameters)
                     {
                         UINT want_read = (UINT)(g_avix.StreamSize + 8);
                         pbuf = framebuf;
-                        res = video_file_read(video_favi, pbuf, want_read, (UINT*)&nr);    /* 读取整帧+下一帧数据流ID信息 */
+                        res = video_file_read(video_favi, pbuf, want_read, &nr);    /* 读取整帧+下一帧数据流ID信息 */
 
                         if (res != FR_OK)
                         {
-                            read_fail_count++;
-                            if (read_fail_count >= VIDEO_READ_RETRY_MAX)
-                            {
-                                video_sd_lost();
-                            }
-                            else
-                            {
-                                res = FR_OK;
-                                key = VIDEO_NULL;
-                            }
+                            video_sd_lost();
                             break;
                         }
 
-                        read_fail_count = 0;
-
-                        if (nr >= g_avix.StreamSize)
+                        if (nr >= g_avix.StreamDataSize)
                         {
-                            res = mjpegdec_decode(pbuf, g_avix.StreamSize,video_show);
-                        
-                            if (res != 0)
+                            uint8_t decode_res = mjpegdec_decode(pbuf, g_avix.StreamDataSize,video_show);
+
+                            if (decode_res != 0)
                             {
                                 printf("decode error!\r\n");
+                                vTaskDelay(1);
+                            }
+                            else
+                            {
+                                file_frame_shown = true;
+                                unplayable_count = 0;
+                                if (video_frame_start != 0)
+                                {
+                                    int64_t elapsed = esp_timer_get_time() - video_frame_start;
+                                    int64_t wait = (int64_t)g_avix.SecPerFrame - elapsed;
+                                    if (wait > 0 && wait < 1000000)
+                                    {
+                                        vTaskDelay(pdMS_TO_TICKS(wait / 1000));
+                                    }
+                                    else
+                                    {
+                                        vTaskDelay(1);
+                                    }
+                                }
+                                video_frame_start = esp_timer_get_time();
                             }
                         }
 
                         if (nr < want_read)
                         {
                             res = FR_OK;
-                            key = VIDEO_NULL;
+                            key = file_frame_shown ? VIDEO_NULL : VIDEO_NEXT;
+                            automatic_advance = !file_frame_shown;
                             break;
                         }
 
@@ -1017,38 +1118,29 @@ void video(void *pvParameters)
                     else
                     {
                         UINT want_read = (UINT)(g_avix.StreamSize + 8);
-                        res = video_file_read(video_favi, framebuf, want_read, (UINT*)&nr);       /* 填充psaibuf */
+                        res = video_file_read(video_favi, framebuf, want_read, &nr);       /* 填充psaibuf */
 
                         if (res != FR_OK)
                         {
-                            read_fail_count++;
-                            if (read_fail_count >= VIDEO_READ_RETRY_MAX)
-                            {
-                                video_sd_lost();
-                            }
-                            else
-                            {
-                                res = FR_OK;
-                                key = VIDEO_NULL;
-                            }
+                            video_sd_lost();
                             break;
                         }
-
-                        read_fail_count = 0;
 
                         if (nr < want_read)
                         {
                             res = FR_OK;
-                            key = VIDEO_NULL;
+                            key = file_frame_shown ? VIDEO_NULL : VIDEO_NEXT;
+                            automatic_advance = !file_frame_shown;
                             break;
                         }
 
                         pbuf = framebuf;
                     }
                     
-                    if (avi_get_streaminfo(pbuf + g_avix.StreamSize) != 0)
+                    if (g_avix.StreamSize > nr || avi_get_streaminfo(pbuf + g_avix.StreamSize, nr - g_avix.StreamSize) != 0)
                     {
-                        key = VIDEO_NULL;
+                        key = file_frame_shown ? VIDEO_NULL : VIDEO_NEXT;
+                        automatic_advance = !file_frame_shown;
                         break;
                     }
 
@@ -1084,18 +1176,31 @@ video_file_cleanup:
                     mjpegdec_free();
                     mjpeg_open = 0;
                 }
-				/* 选中SD卡 */
-	            SD_CS(0);
-                f_close(video_favi);
+                sd_f_close(video_favi);
                 video_file_open = 0;
+                if (automatic_advance && !file_frame_shown && video_cfig.video_start)
+                {
+                    unplayable_count++;
+                    if (unplayable_count >= totavinum)
+                    {
+                        video_cfig.video_start = 0;
+                        key = VIDEO_NULL;
+                        if (app_obj_general.del_parent != NULL && app_obj_general.APP_Function != NULL)
+                        {
+                            app_obj_general.app_state = DEL_STATE;
+                        }
+                    }
+                    else
+                    {
+                        vTaskDelay(pdMS_TO_TICKS(25));
+                    }
+                }
                 if (key != 0 && video_cfig.video_start)
                 {
                     video_apply_key(key);
                     key = 0;
                     res = FR_OK;
                 }
-				/* 取消选中SD卡 */
-	            SD_CS(1);
             }
         }
     }
@@ -1115,20 +1220,17 @@ video_file_cleanup:
 
     if (video_file_open)
     {
-        SD_CS(0);
-        f_close(video_favi);
+        sd_f_close(video_favi);
         video_file_open = 0;
-        SD_CS(1);
     }
 
     if (vdir_open)
     {
-        SD_CS(0);
-        f_closedir(&vdir);
+        sd_f_closedir(&vdir);
         vdir_open = 0;
-        SD_CS(1);
     }
 
+    video_sd_session_release();
     VIDEOTask_Handler = NULL;
     vTaskDelete(NULL);
 }
@@ -1178,9 +1280,7 @@ static uint16_t video_get_tnum(char *path)
     
     if (dir_open)
     {
-        SD_CS(0);
-        f_closedir(&tdir);
-        SD_CS(1);
+        sd_f_closedir(&tdir);
     }
 
     return rval;
@@ -1199,6 +1299,13 @@ void lv_video_ui(void)
         return ;
     }
 
+    if (!sd_local_session_begin())
+    {
+        lv_msgbox("SD device not detected");
+        return;
+    }
+    video_sd_session = true;
+
     video_curindex = 0;     /* 当前索引 */
     vfileinfo = 0;          /* 文件信息 */
     video_pname = 0;        /* 带路径的文件名 */
@@ -1209,23 +1316,23 @@ void lv_video_ui(void)
 
     // xl9555_pin_write(SPK_CTRL_IO, 1);   /* 打开喇叭 */
 
-    if (lv_smail_icon_get_state(TF_STATE))
+    if (lv_smail_icon_get_state(TF_STATE) && sd_card_is_mounted())
     {		
         if (video_dir_open_retry(&vdir, "0:/VIDEO"))
         {
-            lv_msgbox("MUSIC folder error");
+            video_sd_session_release();
+            lv_msgbox("VIDEO folder error");
             return ;
         }
         
-        SD_CS(0);
-        f_closedir(&vdir);
-        SD_CS(1);
+        sd_f_closedir(&vdir);
 
         totavinum = video_get_tnum("0:/VIDEO");
 
         if (totavinum == 0)
         {
-            lv_msgbox("No music files");
+            video_sd_session_release();
+            lv_msgbox("No video files");
             return ;
         }
 
@@ -1241,6 +1348,7 @@ void lv_video_ui(void)
             vfileinfo = NULL;
             video_pname = NULL;
             voffsettbl = NULL;
+            video_sd_session_release();
             lv_msgbox("memory allocation failed");
             return ;
         }
@@ -1268,6 +1376,7 @@ void lv_video_ui(void)
             vfileinfo = NULL;
             video_pname = NULL;
             voffsettbl = NULL;
+            video_sd_session_release();
             lv_msgbox("memory error!");
             return ;
         }
@@ -1300,6 +1409,7 @@ void lv_video_ui(void)
         app_obj_general.del_parent = video_cfig.video_box;
         app_obj_general.APP_Function = lv_video_del;
         app_obj_general.app_state = NOT_DEL_STATE;
+        app_obj_general.requires_sd = 1;
 
         video_cfig.video_obj_t.video_img = lv_img_create(video_cfig.video_box);
         lv_obj_set_style_bg_color(video_cfig.video_obj_t.video_img, lv_color_make(50,52,67), LV_STATE_DEFAULT);
@@ -1325,44 +1435,49 @@ void lv_video_ui(void)
 
         if (VIDEOTask_Handler == NULL)
         {
-            xTaskCreatePinnedToCore((TaskFunction_t )video,
+            BaseType_t task_result = xTaskCreatePinnedToCore((TaskFunction_t )video,
                                     (const char*    )"video",
                                     (uint16_t       )VIDEO_STK_SIZE,
                                     (void*          )NULL,
                                     (UBaseType_t    )VIDEO_PRIO,
                                     (TaskHandle_t*  )&VIDEOTask_Handler,
                                     (BaseType_t     ) 1);
+            if (task_result != pdPASS)
+            {
+                video_cfig.video_start = 0;
+                VIDEOTask_Handler = NULL;
+                video_sd_session_release();
+                lv_video_del();
+                lv_msgbox("Task creation failed");
+            }
         }
     }
     else
     {
+        video_sd_session_release();
         lv_msgbox("SD device not detected");
     }
 
 }
 
-void lv_video_del(void)
+static void video_finish_close(void)
 {
+    if (video_close_timer != NULL)
+    {
+        lv_timer_del(video_close_timer);
+        video_close_timer = NULL;
+    }
+
     video_cfig.video_start = 0;
+    video_pending_key = VIDEO_NULL;
 
-    if (VIDEOTask_Handler != NULL)
-    {
-        while (VIDEOTask_Handler != NULL)
-        {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-    SD_CS(1);
-
+    video_sd_session_release();
     esptim_int_deinit();
+    video_detach_image(-1);
     mjpegdec_free();
-
-    if (video_buf != NULL)
-    {
-        mjpegdec_video_free();
-        video_buf_w = 0;
-        video_buf_h = 0;
-    }
+    mjpegdec_video_free();
+    video_buf_w = 0;
+    video_buf_h = 0;
 
     if ((framebuf != NULL))
     {
@@ -1386,18 +1501,23 @@ void lv_video_del(void)
         video_favi = NULL;
     }
 
-    if (app_obj_general.del_parent != NULL && lv_obj_is_valid(app_obj_general.del_parent))
+    if (video_cfig.video_box != NULL && lv_obj_is_valid(video_cfig.video_box))
     {
-        lv_obj_del(app_obj_general.del_parent);
+        lv_obj_del(video_cfig.video_box);
     }
     app_obj_general.del_parent = NULL;
     app_obj_general.APP_Function = NULL;
     app_obj_general.app_state = NOT_DEL_STATE;
+    app_obj_general.requires_sd = 0;
     video_cfig.video_box = NULL;
+    video_cfig.video_obj_t.video_img = NULL;
     video_back_btn = NULL;
     video_img_ready = 0;
     video_img_w = 0;
     video_img_h = 0;
+    video_img_dsc.data = NULL;
+    video_img_dsc.data_size = 0;
+    video_frame_start = 0;
     video_closing = 0;
 
     if (video_dir_changed)
@@ -1414,4 +1534,38 @@ void lv_video_del(void)
     }
 
     lv_display_box();
+}
+
+static void video_close_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    if (VIDEOTask_Handler == NULL)
+    {
+        video_finish_close();
+    }
+}
+
+void lv_video_del(void)
+{
+    if (video_closing)
+    {
+        return;
+    }
+
+    video_closing = 1;
+    video_cfig.video_start = 0;
+    video_pending_key = VIDEO_NULL;
+
+    if (VIDEOTask_Handler != NULL)
+    {
+        video_close_timer = lv_timer_create(video_close_timer_cb, 20, NULL);
+        if (video_close_timer == NULL)
+        {
+            video_closing = 0;
+        }
+        return;
+    }
+
+    video_finish_close();
 }

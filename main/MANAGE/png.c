@@ -135,18 +135,14 @@
      pngle_t *pngle = NULL;
      uint8_t *colors = NULL;
      FRESULT res;
-     uint16_t len;
+     UINT len;
      uint16_t yield_count = 0;
      fp = (FIL *)malloc(sizeof(FIL));
      if (fp == NULL)
      {
          return 0;
      }
-	 /* 选中SD卡 */
-	 SD_CS(0);
-     res = f_open(fp, (const TCHAR *)filename, FA_READ);
-     /* 取消选中SD卡 */
-	 SD_CS(1);
+     res = sd_f_open(fp, (const TCHAR *)filename, FA_READ);
 
      if (res != FR_OK)
      {
@@ -157,7 +153,7 @@
      pngle = pngle_new(width, height);
      if (pngle == NULL)
      {
-         f_close(fp);
+         sd_f_close(fp);
          free(fp);
          return 0;
      }
@@ -178,11 +174,12 @@
              goto fail;
          }
  
-		 /* 选中SD卡 */
-	    SD_CS(0);
-         f_read(fp,buf + remain,sizeof(buf) - remain, (UINT *)&len);
-		/* 取消选中SD卡 */
-		SD_CS(1);
+         res = sd_f_read(fp,buf + remain,sizeof(buf) - remain, &len);
+
+         if (res != FR_OK || (len == 0 && !f_eof(fp)))
+         {
+             goto fail;
+         }
  
          int fed = pngle_feed(pngle, buf, remain + len);
  
@@ -204,8 +201,13 @@
              vTaskDelay(1);
          }
      }
- 
-     f_close(fp);
+
+     if (pngle->state != PNGLE_STATE_EOF || remain != 0)
+     {
+         goto fail;
+     }
+
+     sd_f_close(fp);
  
      _width = pngle->imageWidth;
      _height = pngle->imageHeight;
@@ -244,7 +246,7 @@ fail:
 
      if (fp != NULL)
      {
-         f_close(fp);
+         sd_f_close(fp);
          free(fp);
      }
 

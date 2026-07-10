@@ -60,18 +60,16 @@ lv_fs_res_t lv_file_read(const char *path)
     lv_fs_file_t fd;
     lv_fs_res_t res;
 
-    if (!lv_smail_icon_get_state(TF_STATE))
+    if (!lv_smail_icon_get_state(TF_STATE) || !sd_card_is_mounted())
     {
         return LV_FS_RES_UNKNOWN;
     }
 
     app_file_sd_busy = 1;
-    SD_CS(0);
     res = lv_fs_open(&fd, path, LV_FS_MODE_RD);
     
     if (res != LV_FS_RES_OK)
     {
-        SD_CS(1);
         app_file_sd_busy = 0;
         printf("open %s ERROR\n",path);
         return LV_FS_RES_UNKNOWN;
@@ -91,7 +89,6 @@ lv_fs_res_t lv_file_read(const char *path)
     if (res != LV_FS_RES_OK)
     {
         lv_fs_close(&fd);
-        SD_CS(1);
         app_file_sd_busy = 0;
         printf("read %s ERROR\n",path);
         return LV_FS_RES_UNKNOWN;
@@ -99,7 +96,6 @@ lv_fs_res_t lv_file_read(const char *path)
 
     lv_tell(&fd);
     lv_fs_close(&fd);
-    SD_CS(1);
     app_file_sd_busy = 0;
     
     return LV_FS_RES_OK;
@@ -360,15 +356,7 @@ static void lv_list_btn_event_safe(lv_event_t *event)
             return;
         }
 
-        lv_flie.lv_suffix_flag = 1;
-        for (int suffix = 0; suffix < LV_SUFFIX(lv_suffix); suffix++)
-        {
-            if (strstr(lv_flie.lv_pname, lv_suffix[suffix]) != NULL)
-            {
-                lv_flie.lv_suffix_flag = 0;
-                break;
-            }
-        }
+        lv_flie.lv_suffix_flag = (lv_flie.list_attr[i] & AM_DIR) ? 1 : 0;
 
         char *full_path = lv_pash_joint();
         if (full_path == NULL)
@@ -426,11 +414,10 @@ uint16_t lv_scan_files (const char *path, lv_obj_t *parent)
     }
 
     app_file_sd_busy = 1;
-    SD_CS(0);
-    lv_flie.fr = f_opendir(&lv_flie.lv_dir, path);
-    SD_CS(1);
+    lv_flie.fr = sd_f_opendir(&lv_flie.lv_dir, path);
 
     memset(lv_flie.list_btn, 0, sizeof(lv_flie.list_btn));
+    memset(lv_flie.list_attr, 0, sizeof(lv_flie.list_attr));
     lv_flie.list_flie_nuber = 0;
     lv_create_list(parent);
 
@@ -444,9 +431,7 @@ uint16_t lv_scan_files (const char *path, lv_obj_t *parent)
                 break;
             }
 
-            SD_CS(0);
-            lv_flie.fr = f_readdir(&lv_flie.lv_dir, &lv_flie.SD_fno);
-            SD_CS(1);
+            lv_flie.fr = sd_f_readdir(&lv_flie.lv_dir, &lv_flie.SD_fno);
 
             if ((lv_flie.fr) || lv_flie.SD_fno.fname[0] == 0) break;
             if (lv_flie.list_flie_nuber >= LIST_SIZE) break;
@@ -476,15 +461,14 @@ uint16_t lv_scan_files (const char *path, lv_obj_t *parent)
             
             if (lv_flie.list_btn[lv_flie.list_flie_nuber] == NULL) break;
 
+            lv_flie.list_attr[lv_flie.list_flie_nuber] = lv_flie.SD_fno.fattrib;
             lv_obj_set_style_pad_left(lv_flie.list_btn[lv_flie.list_flie_nuber], 5, LV_STATE_DEFAULT);
             lv_obj_set_style_pad_right(lv_flie.list_btn[lv_flie.list_flie_nuber], 5, LV_STATE_DEFAULT);
             lv_obj_add_event_cb(lv_flie.list_btn[lv_flie.list_flie_nuber], lv_list_btn_event_safe, LV_EVENT_ALL, NULL);
             lv_flie.list_flie_nuber++;
         }
         
-        SD_CS(0);
-        f_closedir(&lv_flie.lv_dir);
-        SD_CS(1);
+        sd_f_closedir(&lv_flie.lv_dir);
     }
 
     app_file_sd_busy = 0;
@@ -510,6 +494,11 @@ void lv_del_list(lv_obj_t *parent)
     }
 }
 
+static void lv_animation_set_x(void *obj, int32_t value)
+{
+    lv_obj_set_x((lv_obj_t *)obj, (lv_coord_t)value);
+}
+
 /**
   * @brief  设置列表动画
   * @param  parent: 父类
@@ -520,7 +509,7 @@ void lv_animation(lv_obj_t *parent)
     lv_anim_t a;                                                /* 第一步：定义一个动画 */
     lv_anim_init(&a);                                           /* 第二步初始化动画 */
     lv_anim_set_var(&a, parent);                                /* 第三步：设置实施动画效果的控件 */
-    lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)lv_obj_set_x);  /* 设置动画功能 var */
+    lv_anim_set_exec_cb(&a, lv_animation_set_x);                /* 设置动画功能 var */
     int32_t start = lv_obj_get_width(lv_scr_act());
     int32_t end = 0;
     lv_anim_set_values(&a, start, end);                         /* 设置开始值和结束值。例如0,150 */
@@ -664,7 +653,7 @@ void list_init(lv_obj_t *parent)
   */
 void app_file_init(void)
 {
-    if (!lv_smail_icon_get_state(TF_STATE))
+    if (!lv_smail_icon_get_state(TF_STATE) || !sd_card_is_mounted())
     {
         lv_msgbox("SD device not detected");
         return ;
@@ -677,6 +666,7 @@ void app_file_init(void)
     app_obj_general.del_parent = lv_flie.lv_page_obj;
     app_obj_general.APP_Function = lv_file_del;
     app_obj_general.app_state = NOT_DEL_STATE;
+    app_obj_general.requires_sd = 1;
 }
 
 /**
@@ -724,6 +714,6 @@ void lv_file_del(void)
     app_obj_general.APP_Function = NULL;
     app_obj_general.del_parent = NULL;
     app_obj_general.app_state = NOT_DEL_STATE;
-    SD_CS(1);
+    app_obj_general.requires_sd = 0;
     lv_display_box();
 }

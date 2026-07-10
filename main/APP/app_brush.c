@@ -53,6 +53,7 @@ void lv_touch_task(lv_timer_t *task)
             lv_touch.current_point.y = y;
 
             lv_draw_line_dsc_t line_dsc1;
+			lv_draw_line_dsc_init(&line_dsc1);
             line_dsc1.color = lv_touch.pen_color;       
             line_dsc1.width = lv_touch.touch_pen_size;  
             line_dsc1.opa = LV_OPA_COVER;               
@@ -275,21 +276,21 @@ void lv_brush_del(void)
         lv_touch.touch_timer = NULL;
     }
 
-    if (lv_touch.cbuf != NULL)
-    {
-        free(lv_touch.cbuf);
-    }
-    lv_touch.cbuf = NULL;
-    lv_touch.lv_touch_cont = NULL;
-    box_pen_state = 0;
-    box_pen_color_state = 0;
-	
     /* 删除画笔父类 */
     if (lv_touch.box_eraser_cont != NULL && lv_obj_is_valid(lv_touch.box_eraser_cont))
     {
         lv_obj_del(lv_touch.box_eraser_cont);
     }
     lv_touch.box_eraser_cont = NULL;
+    lv_touch.lv_touch_cont = NULL;
+
+    if (lv_touch.cbuf != NULL)
+    {
+        heap_caps_free(lv_touch.cbuf);
+    }
+    lv_touch.cbuf = NULL;
+    box_pen_state = 0;
+    box_pen_color_state = 0;
     /* 显示主界面 */
     lv_display_box();
 }

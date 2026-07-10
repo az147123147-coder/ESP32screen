@@ -44,7 +44,6 @@ void test_handler(void)
     int status = 0;
     Test_Typedef *data;
     Test_Typedef *data_temp;
-    data = (Test_Typedef *)malloc(sizeof(Test_Typedef));    /* 申请控件内存 */
 
     /* 遍历测试项目链表 */
     atk_list_for_each_entry_safe(data, data_temp, &test_list_head, Test_Typedef, test_list_node)

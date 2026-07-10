@@ -15,6 +15,58 @@
 
 #define FILE_MAX_TYPE_NUM       7       /* 最多FILE_MAX_TYPE_NUM个大类 */
 #define FILE_MAX_SUBT_NUM       7       /* 最多FILE_MAX_SUBT_NUM个小类 */
+#define EXFUNS_PATH_CAPACITY     (512U + 1U)
+
+static size_t exfuns_string_length(const char *value, size_t limit)
+{
+    size_t length = 0;
+    while (length < limit && value[length] != '\0')
+    {
+        length++;
+    }
+    return length;
+}
+
+static bool exfuns_path_copy(uint8_t *destination, size_t capacity, const char *source)
+{
+    if (destination == NULL || source == NULL || capacity == 0)
+    {
+        return false;
+    }
+
+    size_t source_length = exfuns_string_length(source, capacity);
+    if (source_length >= capacity)
+    {
+        return false;
+    }
+
+    memcpy(destination, source, source_length + 1);
+    return true;
+}
+
+static bool exfuns_path_append(uint8_t *destination, size_t capacity, const char *source)
+{
+    if (destination == NULL || source == NULL || capacity == 0)
+    {
+        return false;
+    }
+
+    size_t destination_length = exfuns_string_length((const char *)destination, capacity);
+    if (destination_length >= capacity)
+    {
+        return false;
+    }
+
+    size_t available = capacity - destination_length;
+    size_t source_length = exfuns_string_length(source, available);
+    if (source_length >= available)
+    {
+        return false;
+    }
+
+    memcpy(destination + destination_length, source, source_length + 1);
+    return true;
+}
 
 /* 文件类型定义 */
 static const char *FILE_TYPE_TBL[FILE_MAX_TYPE_NUM][FILE_MAX_SUBT_NUM] = {
@@ -91,55 +143,50 @@ uint8_t exfuns_char_upper(uint8_t c)
  */
 uint8_t exfuns_file_type(char *fname)
 {
-    uint8_t tbuf[5];
-    char *attr = 0;                 /* 后缀名 */
-    uint8_t i = 0, j;
+    uint8_t tbuf[5] = {0};
+    const char *ext;
+    const char *dot;
+    size_t ext_len;
 
-    while (i < 250)
+    if (fname == NULL || fname[0] == '\0')
     {
-        i++;
-
-        if (*fname == '\0')break;   /* 偏移到了最后了. */
-
-        fname++;
+        return 0XFF;
     }
 
-    if (i == 250)return 0XFF;   /* 错误的字符串. */
-
-    for (i = 0; i < 5; i++)     /* 得到后缀名 */
+    dot = strrchr(fname, '.');
+    if (dot == NULL || dot[1] == '\0')
     {
-        fname--;
-
-        if (*fname == '.')
-        {
-            fname++;
-            attr = fname;
-            break;
-        }
+        return 0XFF;
     }
 
-    if (attr == 0) return 0XFF;
-
-    strcpy((char *)tbuf, (const char *)attr);       /* copy */
-
-    for (i = 0; i < 4; i++) tbuf[i] = exfuns_char_upper(tbuf[i]);   /* 全部变为大写 */
-
-    for (i = 0; i < FILE_MAX_TYPE_NUM; i++)         /* 大类对比 */
+    ext = dot + 1;
+    ext_len = strlen(ext);
+    if (ext_len == 0 || ext_len >= sizeof(tbuf))
     {
-        for (j = 0; j < FILE_MAX_SUBT_NUM; j++)     /* 子类对比 */
-        {
-            if (*FILE_TYPE_TBL[i][j] == 0) break;   /* 此组已经没有可对比的成员了. */
+        return 0XFF;
+    }
 
-            if (strcmp((const char *)FILE_TYPE_TBL[i][j], (const char *)tbuf) == 0) /* 找到了 */
+    strcpy((char *)tbuf, ext);
+    for (uint8_t i = 0; i < ext_len; i++)
+    {
+        tbuf[i] = exfuns_char_upper(tbuf[i]);
+    }
+
+    for (uint8_t i = 0; i < FILE_MAX_TYPE_NUM; i++)
+    {
+        for (uint8_t j = 0; j < FILE_MAX_SUBT_NUM; j++)
+        {
+            if (*FILE_TYPE_TBL[i][j] == 0) break;
+
+            if (strcmp((const char *)FILE_TYPE_TBL[i][j], (const char *)tbuf) == 0)
             {
                 return (i << 4) | j;
             }
         }
     }
 
-    return 0XFF;    /* 没找到 */
+    return 0XFF;
 }
-
 /**
  * @brief       获取磁盘剩余容量
  * @param       pdrv : 磁盘编号("0:"~"9:")
@@ -151,10 +198,16 @@ uint8_t exfuns_get_free(uint8_t *pdrv, uint32_t *total, uint32_t *free)
 {
     FATFS *fs1;
     uint8_t res;
-    uint32_t fre_clust = 0, fre_sect = 0, tot_sect = 0;
+    DWORD fre_clust = 0;
+    uint32_t fre_sect = 0, tot_sect = 0;
     
     /* 得到磁盘信息及空闲簇数量 */
-    res = (uint32_t)f_getfree((const TCHAR *)pdrv, (DWORD *)&fre_clust, &fs1);
+    if (!sd_access_begin(portMAX_DELAY))
+    {
+        return FR_NOT_READY;
+    }
+    res = (uint8_t)f_getfree((const TCHAR *)pdrv, &fre_clust, &fs1);
+    sd_access_end();
 
     if (res == 0)
     {
@@ -203,13 +256,15 @@ uint8_t exfuns_file_copy(uint8_t(*fcpymsg)(uint8_t *pname, uint8_t pct, uint8_t 
                          uint32_t totsize, uint32_t cpdsize, uint8_t fwmode)
 {
     uint8_t res;
-    uint16_t br = 0;
-    uint16_t bw = 0;
+    UINT br = 0;
+    UINT bw = 0;
     FIL *fsrc = 0;
     FIL *fdst = 0;
     uint8_t *fbuf = 0;
     uint8_t curpct = 0;
     unsigned long long lcpdsize = cpdsize;
+    bool source_open = false;
+    bool destination_open = false;
     
     fsrc = (FIL *)malloc(sizeof(FIL));    /* 申请内存 */
     fdst = (FIL *)malloc(sizeof(FIL));
@@ -229,17 +284,13 @@ uint8_t exfuns_file_copy(uint8_t(*fcpymsg)(uint8_t *pname, uint8_t pct, uint8_t 
         {
             fwmode = FA_CREATE_ALWAYS;  /* 覆盖存在的文件 */
         }
-        /* 选中SD卡 */
-	    SD_CS(0);
-        res = f_open(fsrc, (const TCHAR *)psrc, FA_READ | FA_OPEN_EXISTING);        /* 打开只读文件 */
-		/* 取消选中SD卡 */
-	    SD_CS(1);
-
-		/* 选中SD卡 */
-	    SD_CS(0);
-        if (res == 0)res = f_open(fdst, (const TCHAR *)pdst, FA_WRITE | fwmode);    /* 第一个打开成功,才开始打开第二个 */
-		/* 取消选中SD卡 */
-		SD_CS(1);
+        res = sd_f_open(fsrc, (const TCHAR *)psrc, FA_READ | FA_OPEN_EXISTING);        /* 打开只读文件 */
+        if (res == FR_OK)
+        {
+            source_open = true;
+            res = sd_f_open(fdst, (const TCHAR *)pdst, FA_WRITE | fwmode);    /* 第一个打开成功,才开始打开第二个 */
+            destination_open = res == FR_OK;
+        }
 
         if (res == 0)           /* 两个都打开成功了 */
         {
@@ -258,19 +309,17 @@ uint8_t exfuns_file_copy(uint8_t(*fcpymsg)(uint8_t *pname, uint8_t pct, uint8_t 
 
             while (res == 0)    /* 开始复制 */
             {
-				/* 选中SD卡 */
-				SD_CS(0);
-				res = f_read(fsrc, fbuf, 8192, (UINT *)&br);    /* 源头读出512字节 */
-				/* 取消选中SD卡 */
-				SD_CS(1);
+                res = sd_f_read(fsrc, fbuf, 8192, &br);    /* 源头读出512字节 */
 
                 if (res || br == 0)break;
 
-				/* 选中SD卡 */
-				SD_CS(0);
-				res = f_write(fdst, fbuf, (UINT)br, (UINT *)&bw);/* 写入目的文件 */
-				/* 取消选中SD卡 */
-				SD_CS(1);
+                res = sd_f_write(fdst, fbuf, br, &bw);/* 写入目的文件 */
+                if (res == FR_OK && bw != br)
+                {
+                    res = FR_DISK_ERR;
+                }
+                if (res != FR_OK)break;
+
                 lcpdsize += bw;
 
                 if (curpct != (lcpdsize * 100) / totsize)       /* 是否需要更新百分比 */
@@ -283,16 +332,27 @@ uint8_t exfuns_file_copy(uint8_t(*fcpymsg)(uint8_t *pname, uint8_t pct, uint8_t 
                         break;
                     }
                 }
-
-                if (res || bw < br)break;
             }
-
-            f_close(fsrc);
-            f_close(fdst);
         }
     }
 
-	
+    if (destination_open)
+    {
+        FRESULT close_res = sd_f_close(fdst);
+        if (res == FR_OK && close_res != FR_OK)
+        {
+            res = (uint8_t)close_res;
+        }
+    }
+    if (source_open)
+    {
+        FRESULT close_res = sd_f_close(fsrc);
+        if (res == FR_OK && close_res != FR_OK)
+        {
+            res = (uint8_t)close_res;
+        }
+    }
+
     free(fsrc); /* 释放内存 */
     free(fdst);
     free(fbuf);
@@ -308,19 +368,28 @@ uint8_t exfuns_file_copy(uint8_t(*fcpymsg)(uint8_t *pname, uint8_t pct, uint8_t 
  */
 uint8_t *exfuns_get_src_dname(uint8_t *pname)
 {
-    uint16_t temp = 0;
-
-    while (*pname != 0)
+    if (pname == NULL)
     {
-        pname++;
-        temp++;
+        return 0;
     }
 
-    if (temp < 4) return 0;
+    uint8_t *component = pname;
+    size_t length = 0;
+    while (length < EXFUNS_PATH_CAPACITY && pname[length] != 0)
+    {
+        if (pname[length] == 0x5c || pname[length] == 0x2f || pname[length] == ':')
+        {
+            component = pname + length + 1;
+        }
+        length++;
+    }
 
-    while ((*pname != 0x5c) && (*pname != 0x2f)) pname--;    /* 追述到倒数第一个"\"或者"/"处 */
+    if (length == EXFUNS_PATH_CAPACITY || component == pname + length)
+    {
+        return 0;
+    }
 
-    return ++pname;
+    return component;
 }
 
 /**
@@ -332,13 +401,13 @@ uint8_t *exfuns_get_src_dname(uint8_t *pname)
  */
 uint32_t exfuns_get_folder_size(uint8_t *fdname)
 {
-#define MAX_PATHNAME_DEPTH  512 + 1     /* 最大目标文件路径+文件名深度 */
     uint8_t res = 0;
     FF_DIR *fddir = 0;          /* 目录 */
     FILINFO *finfo = 0;         /* 文件信息 */
     uint8_t *pathname = 0;      /* 目标文件夹路径+文件名 */
     uint16_t pathlen = 0;       /* 目标路径长度 */
     uint32_t fdsize = 0;
+    bool dir_open = false;
 
     fddir = (FF_DIR *)malloc(sizeof(FF_DIR));   /* 申请内存 */
     finfo = (FILINFO *)malloc(sizeof(FILINFO));
@@ -347,28 +416,26 @@ uint32_t exfuns_get_folder_size(uint8_t *fdname)
 
     if (res == 0)
     {
-        pathname = malloc(MAX_PATHNAME_DEPTH);
+        pathname = malloc(EXFUNS_PATH_CAPACITY);
 
         if (pathname == NULL)res = 101;
 
         if (res == 0)
         {
-            pathname[0] = 0;
-			/* 选中SD卡 */
-			SD_CS(0);
-			strcat((char *)pathname, (const char *)fdname);     /* 复制路径 */
-			res = f_opendir(fddir, (const TCHAR *)fdname);      /* 打开源目录 */
-			/* 取消选中SD卡 */
-			SD_CS(1);
+            if (!exfuns_path_copy(pathname, EXFUNS_PATH_CAPACITY, (const char *)fdname))
+            {
+                res = FR_INVALID_NAME;
+            }
+            else
+            {
+				res = sd_f_opendir(fddir, (const TCHAR *)fdname);      /* 打开源目录 */
+            }
+			dir_open = res == FR_OK;
             if (res == 0)           /* 打开目录成功 */
             {
                 while (res == 0)    /* 开始复制文件夹里面的东东 */
                 {
-					/* 选中SD卡 */
-					SD_CS(0);
-					res = f_readdir(fddir, finfo);                      /* 读取目录下的一个文件 */
-					/* 取消选中SD卡 */
-					SD_CS(1);
+					res = sd_f_readdir(fddir, finfo);                      /* 读取目录下的一个文件 */
                     if (res != FR_OK || finfo->fname[0] == 0) break;    /* 错误了/到末尾了,退出 */
 
                     if (finfo->fname[0] == '.')continue;                /* 忽略上级目录 */
@@ -376,8 +443,13 @@ uint32_t exfuns_get_folder_size(uint8_t *fdname)
                     if (finfo->fattrib & 0X10)   /* 是子目录(文件属性,0X20,归档文件;0X10,子目录;) */
                     {
                         pathlen = strlen((const char *)pathname);       /* 得到当前路径的长度 */
-                        strcat((char *)pathname, (const char *)"/");    /* 加斜杠 */
-                        strcat((char *)pathname, (const char *)finfo->fname);   /* 源路径加上子目录名字 */
+                        if (!exfuns_path_append(pathname, EXFUNS_PATH_CAPACITY, "/") ||
+                            !exfuns_path_append(pathname, EXFUNS_PATH_CAPACITY, finfo->fname))
+                        {
+                            pathname[pathlen] = 0;
+                            res = FR_INVALID_NAME;
+                            break;
+                        }
                         //printf("\r\nsub folder:%s\r\n",pathname);     /* 打印子目录名 */
                         fdsize += exfuns_get_folder_size(pathname);     /* 得到子目录大小,递归调用 */
                         pathname[pathlen] = 0;                          /* 加入结束符 */
@@ -393,8 +465,14 @@ uint32_t exfuns_get_folder_size(uint8_t *fdname)
         }
     }
 
-	/* 取消选中SD卡 */
-	SD_CS(1);
+    if (dir_open)
+    {
+        FRESULT close_res = sd_f_closedir(fddir);
+        if (res == FR_OK && close_res != FR_OK)
+        {
+            res = (uint8_t)close_res;
+        }
+    }
     free(fddir);
     free(finfo);
 
@@ -441,7 +519,6 @@ uint32_t exfuns_get_folder_size(uint8_t *fdname)
 uint8_t exfuns_folder_copy(uint8_t(*fcpymsg)(uint8_t *pname, uint8_t pct, uint8_t mode), uint8_t *psrc, uint8_t *pdst, 
                            uint32_t *totsize, uint32_t *cpdsize, uint8_t fwmode)
 {
-#define MAX_PATHNAME_DEPTH 512 + 1  /* 最大目标文件路径+文件名深度 */
     uint8_t res = 0;
     FF_DIR *srcdir = 0;     /* 源目录 */
     FF_DIR *dstdir = 0;     /* 源目录 */
@@ -453,6 +530,7 @@ uint8_t exfuns_folder_copy(uint8_t(*fcpymsg)(uint8_t *pname, uint8_t pct, uint8_
 
     uint16_t dstpathlen = 0;    /* 目标路径长度 */
     uint16_t srcpathlen = 0;    /* 源路径长度 */
+    bool source_dir_open = false;
 
 
     srcdir = (FF_DIR *)malloc(sizeof(FF_DIR));  /* 申请内存 */
@@ -463,48 +541,61 @@ uint8_t exfuns_folder_copy(uint8_t(*fcpymsg)(uint8_t *pname, uint8_t pct, uint8_
 
     if (res == 0)
     {
-        dstpathname = malloc(MAX_PATHNAME_DEPTH);
-        srcpathname = malloc(MAX_PATHNAME_DEPTH);
+        dstpathname = malloc(EXFUNS_PATH_CAPACITY);
+        srcpathname = malloc(EXFUNS_PATH_CAPACITY);
 
         if (dstpathname == NULL || srcpathname == NULL)res = 101;
 
         if (res == 0)
         {
-            dstpathname[0] = 0;
-            srcpathname[0] = 0;
-			/* 选中SD卡 */
-			SD_CS(0);
-			strcat((char *)srcpathname, (const char *)psrc);    /* 复制原始源文件路径 */
-			strcat((char *)dstpathname, (const char *)pdst);    /* 复制原始目标文件路径 */
-			res = f_opendir(srcdir, (const TCHAR *)psrc);       /* 打开源目录 */
-			/* 取消选中SD卡 */
-			SD_CS(1);
+            if (!exfuns_path_copy(srcpathname, EXFUNS_PATH_CAPACITY, (const char *)psrc) ||
+                !exfuns_path_copy(dstpathname, EXFUNS_PATH_CAPACITY, (const char *)pdst))
+            {
+                res = FR_INVALID_NAME;
+            }
+            else
+            {
+				res = sd_f_opendir(srcdir, (const TCHAR *)psrc);       /* 打开源目录 */
+            }
+			source_dir_open = res == FR_OK;
 
             if (res == 0)       /* 打开目录成功 */
             {
-                strcat((char *)dstpathname, (const char *)"/"); /* 加入斜杠 */
+                if (!exfuns_path_append(dstpathname, EXFUNS_PATH_CAPACITY, "/"))
+                {
+                    res = FR_INVALID_NAME;
+                }
                 fn = exfuns_get_src_dname(psrc);
 
-                if (fn == 0)    /* 卷标拷贝 */
+                if (res == FR_OK && fn == 0)    /* 卷标拷贝 */
                 {
                     dstpathlen = strlen((const char *)dstpathname);
-                    dstpathname[dstpathlen] = psrc[0];          /* 记录卷标 */
-                    dstpathname[dstpathlen + 1] = 0;            /* 结束符 */
+                    if ((size_t)dstpathlen + 1 >= EXFUNS_PATH_CAPACITY)
+                    {
+                        res = FR_INVALID_NAME;
+                    }
+                    else
+                    {
+                        dstpathname[dstpathlen] = psrc[0];          /* 记录卷标 */
+                        dstpathname[dstpathlen + 1] = 0;            /* 结束符 */
+                    }
                 }
-                else strcat((char *)dstpathname, (const char *)fn); /* 加文件名 */
+                else if (res == FR_OK && !exfuns_path_append(dstpathname, EXFUNS_PATH_CAPACITY, (const char *)fn))
+                {
+                    res = FR_INVALID_NAME;
+                }
 
-                fcpymsg(fn, 0, 0X04);                           /* 更新文件夹名 */
-                res = f_mkdir((const TCHAR *)dstpathname);      /* 如果文件夹已经存在,就不创建.如果不存在就创建新的文件夹. */
+                if (res == FR_OK)
+                {
+                    fcpymsg(fn, 0, 0X04);                           /* 更新文件夹名 */
+                    res = sd_f_mkdir((const TCHAR *)dstpathname);      /* 如果文件夹已经存在,就不创建.如果不存在就创建新的文件夹. */
+                }
 
                 if (res == FR_EXIST) res = 0;
 
                 while (res == 0)                                /* 开始复制文件夹里面的东东 */
                 {
-					/* 选中SD卡 */
-					SD_CS(0);
-					res = f_readdir(srcdir, finfo);             /* 读取目录下的一个文件 */
-					/* 取消选中SD卡 */
-					SD_CS(1);
+					res = sd_f_readdir(srcdir, finfo);             /* 读取目录下的一个文件 */
                     if (res != FR_OK || finfo->fname[0] == 0)break;     /* 错误了/到末尾了,退出 */
 
                     if (finfo->fname[0] == '.')continue;        /* 忽略上级目录 */
@@ -513,21 +604,39 @@ uint8_t exfuns_folder_copy(uint8_t(*fcpymsg)(uint8_t *pname, uint8_t pct, uint8_
                     dstpathlen = strlen((const char *)dstpathname);     /* 得到当前目标路径的长度 */
                     srcpathlen = strlen((const char *)srcpathname);     /* 得到源路径长度 */
 
-                    strcat((char *)srcpathname, (const char *)"/");     /* 源路径加斜杠 */
-
-                    if (finfo->fattrib & 0X10)  /* 是子目录(文件属性,0X20,归档文件;0X10,子目录;) */
+                    if (!exfuns_path_append(srcpathname, EXFUNS_PATH_CAPACITY, "/"))
                     {
-                        strcat((char *)srcpathname, (const char *)fn);  /* 源路径加上子目录名字 */
-                        res = exfuns_folder_copy(fcpymsg, srcpathname, dstpathname, totsize, cpdsize, fwmode);   /* 拷贝文件夹 */
+                        res = FR_INVALID_NAME;
                     }
-                    else     /* 非目录 */
+
+                    if (res == FR_OK && (finfo->fattrib & 0X10))  /* 是子目录(文件属性,0X20,归档文件;0X10,子目录;) */
                     {
-                        strcat((char *)dstpathname, (const char *)"/"); /* 目标路径加斜杠 */
-                        strcat((char *)dstpathname, (const char *)fn);  /* 目标路径加文件名 */
-                        strcat((char *)srcpathname, (const char *)fn);  /* 源路径加文件名 */
-                        fcpymsg(fn, 0, 0X01);       /* 更新文件名 */
-                        res = exfuns_file_copy(fcpymsg, srcpathname, dstpathname, *totsize, *cpdsize, fwmode);  /* 复制文件 */
-                        *cpdsize += finfo->fsize;   /* 增加一个文件大小 */
+                        if (!exfuns_path_append(srcpathname, EXFUNS_PATH_CAPACITY, (const char *)fn))
+                        {
+                            res = FR_INVALID_NAME;
+                        }
+                        else
+                        {
+                            res = exfuns_folder_copy(fcpymsg, srcpathname, dstpathname, totsize, cpdsize, fwmode);   /* 拷贝文件夹 */
+                        }
+                    }
+                    else if (res == FR_OK)     /* 非目录 */
+                    {
+                        if (!exfuns_path_append(dstpathname, EXFUNS_PATH_CAPACITY, "/") ||
+                            !exfuns_path_append(dstpathname, EXFUNS_PATH_CAPACITY, (const char *)fn) ||
+                            !exfuns_path_append(srcpathname, EXFUNS_PATH_CAPACITY, (const char *)fn))
+                        {
+                            res = FR_INVALID_NAME;
+                        }
+                        else
+                        {
+                            fcpymsg(fn, 0, 0X01);       /* 更新文件名 */
+                            res = exfuns_file_copy(fcpymsg, srcpathname, dstpathname, *totsize, *cpdsize, fwmode);  /* 复制文件 */
+                            if (res == FR_OK)
+                            {
+                                *cpdsize += finfo->fsize;   /* 增加一个文件大小 */
+                            }
+                        }
                     }
 
                     srcpathname[srcpathlen] = 0;    /* 加入结束符 */
@@ -540,8 +649,14 @@ uint8_t exfuns_folder_copy(uint8_t(*fcpymsg)(uint8_t *pname, uint8_t pct, uint8_
         }
     }
 
-	/* 取消选中SD卡 */
-	SD_CS(1);
+    if (source_dir_open)
+    {
+        FRESULT close_res = sd_f_closedir(srcdir);
+        if (res == FR_OK && close_res != FR_OK)
+        {
+            res = (uint8_t)close_res;
+        }
+    }
     free(srcdir);
     free(dstdir);
     free(finfo);

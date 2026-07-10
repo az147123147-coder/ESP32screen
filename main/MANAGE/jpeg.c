@@ -34,25 +34,17 @@
   */
  static unsigned int infunc(JDEC *decoder, uint8_t *buf, unsigned int len)
  {
-     uint16_t  rb;                           /* Read nd bytes from the input strem */
+     UINT rb = 0;                            /* Read nd bytes from the input strem */
      FIL *dev = (FIL *)decoder->device;
  
      if (buf)
      {
-		 /* 选中SD卡 */
-		 SD_CS(0);
-         f_read(dev, buf, len, (UINT *)&rb);
-		 /* 取消选中SD卡 */
-	     SD_CS(1);
-         return rb;
+         FRESULT res = sd_f_read(dev, buf, len, &rb);
+         return (res == FR_OK) ? rb : 0;
      }
      else                                    /* Skip nd bytes on the input stream */
      {
-		 /* 选中SD卡 */
-		 SD_CS(0);
-         FRESULT res = f_lseek(dev, f_tell(dev) + len);
-		 /* 取消选中SD卡 */
-	     SD_CS(1);
+         FRESULT res = sd_f_lseek(dev, f_tell(dev) + len);
          return (res == FR_OK) ? len : 0;
      }
  }
@@ -161,11 +153,7 @@
          goto err;
      }
  
-	 /* 选中SD卡 */
-	 SD_CS(0);
-     open_res = f_open(f_jpeg, (const TCHAR *)file, FA_READ);
-	 /* 取消选中SD卡 */
-	 SD_CS(1);
+     open_res = sd_f_open(f_jpeg, (const TCHAR *)file, FA_READ);
      if (open_res != FR_OK)
      {
          ESP_LOGW(__FUNCTION__, "Image file not found [%s]", file);
@@ -241,7 +229,7 @@
  
      /* All done! Free the work area (as we don't need it anymore) and return victoriously */
      free(work);
-     f_close(f_jpeg);
+     sd_f_close(f_jpeg);
      free(f_jpeg);
      return ret;
  
@@ -249,7 +237,7 @@
      err:
      if (f_jpeg != NULL)
      {
-         f_close(f_jpeg);
+         sd_f_close(f_jpeg);
          free(f_jpeg);
      }
  

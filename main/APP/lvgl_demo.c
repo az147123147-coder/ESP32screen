@@ -32,6 +32,7 @@ extern uint8_t temp[4];
 extern TaskHandle_t VIDEOTask_Handler;
 extern TaskHandle_t PICTask_Handler;
 extern volatile uint8_t app_file_sd_busy;
+extern bool video_touch_mirrored;
 
 /* SD_TASK 任务 配置
  * 包括: 任务优先级 堆栈大小 任务句柄 创建任务
@@ -46,42 +47,13 @@ void sd_task(void *pvParameters);
 TaskHandle_t UARTTask_Handler;
 void uart_task(void *pvParameters);
 
-#define KEY_TASK_PRIO       2
-#define KEY_STK_SIZE        2 * 1024
-TaskHandle_t KEYTask_Handler;
-void key_task(void *pvParameters);
-
 static SemaphoreHandle_t lvgl_mux = NULL;
+static volatile bool lvgl_flush_pending = false;
 
 #define TEST_CHAR      'a'
 #define SEND_INTERVAL  1000
 #define READ_TIMEOUT   50
 
-void key_task(void *pvParameters)
-{
-    pvParameters = pvParameters;
-    uint8_t key;
-
-    while(1)
-    {
-        key = key_scan(0);
-
-        switch (key)
-        {
-            case BOOT_PRES:
-            {
-                LED1_TOGGLE();
-                break;
-            }
-            default:
-            {
-                break;
-            }
-        }
-
-        vTaskDelay(10);
-    }
-}
 /**
  * @brief       uart
  * @param       pvParameters : 传入参数(未用到)
@@ -90,7 +62,14 @@ void key_task(void *pvParameters)
 void uart_task(void *pvParameters)
 {
     pvParameters = pvParameters;
-    uint8_t *rx_buffer = malloc(RX_BUF_SIZE);  
+    uint8_t *rx_buffer = malloc(RX_BUF_SIZE);
+    if (rx_buffer == NULL)
+    {
+        ESP_LOGE(TAG, "uart_task malloc failed");
+        UARTTask_Handler = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
 
 	while(1) 
 	{
@@ -147,19 +126,10 @@ void sd_task(void *pvParameters)
 
     while(1)
     {
-        if (VIDEOTask_Handler != NULL || PICTask_Handler != NULL || app_file_sd_busy || (g_usbdev.status & 0x01))
+        if (VIDEOTask_Handler != NULL || PICTask_Handler != NULL || app_file_sd_busy || sd_usb_has_ownership())
         {
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
-        }
-
-        if(fs_open_flag == 0 || fs_read_flag == 0 || fs_dir_open_flag == 0 || fs_dir_read_flag == 0)
-        {
-            SD_CS(0);
-        }
-        else if(fs_open_flag == 1 && fs_read_flag == 1 && fs_dir_open_flag == 1 && fs_dir_read_flag == 1)
-        {
-            SD_CS(1);
         }
 
         poll_tick += 500;
@@ -179,7 +149,7 @@ void sd_task(void *pvParameters)
                     }
                     sd_present_last = 0;
 
-                    if (app_obj_general.del_parent != NULL && app_obj_general.APP_Function != NULL)
+                    if (app_obj_general.del_parent != NULL && app_obj_general.APP_Function != NULL && app_obj_general.requires_sd)
                     {
                         app_obj_general.app_state = DEL_STATE;
                     }
@@ -238,8 +208,26 @@ static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
     int offsetx2 = area->x2;
     int offsety1 = area->y1;
     int offsety2 = area->y2;
-    esp_lcd_panel_draw_bitmap((esp_lcd_panel_handle_t) drv->user_data, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
-    lv_disp_flush_ready(drv);
+    lvgl_flush_pending = true;
+    esp_err_t ret = esp_lcd_panel_draw_bitmap((esp_lcd_panel_handle_t) drv->user_data, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
+    if (ret != ESP_OK)
+    {
+        lvgl_flush_pending = false;
+        lv_disp_flush_ready(drv);
+    }
+}
+
+bool lvgl_notify_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
+{
+    lv_disp_drv_t *drv = (lv_disp_drv_t *)user_ctx;
+
+    if (lvgl_flush_pending && drv != NULL && drv->draw_buf != NULL)
+    {
+        lvgl_flush_pending = false;
+        lv_disp_flush_ready(drv);
+    }
+
+    return false;
 }
 
 /**
@@ -322,6 +310,11 @@ static void lvgl_port_task(void *arg)
  */
 static bool touchpad_is_pressed(void)
 {
+    if (tp_dev.scan == NULL)
+    {
+        return false;
+    }
+
     tp_dev.scan(0);
 
     if (tp_dev.sta & TP_PRES_DOWN)
@@ -353,6 +346,11 @@ void touchpad_get_xy(lv_coord_t *x, lv_coord_t *y)
 void touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
 {
 	assert(indev_drv); /* 确保驱动程序有效 */
+    if (tp_dev.scan == NULL)
+    {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
     /* 从触摸控制器读取数据到内存 */
     tp_dev.scan(0); /* 扫描触摸数据 */
 
@@ -360,6 +358,13 @@ void touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
     {
         data->point.x = tp_dev.x[0]; /* 获取触摸点X坐标 */
         data->point.y = tp_dev.y[0]; /* 获取触摸点Y坐标 */
+
+        if (video_touch_mirrored)
+        {
+            data->point.x = lcd_dev.width - 1 - data->point.x;
+            data->point.y = lcd_dev.height - 1 - data->point.y;
+        }
+
         data->state = LV_INDEV_STATE_PRESSED; /* 设置状态为按下 */
     }
     else
@@ -392,7 +397,10 @@ static void keypad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
             case BOOT_PRES:
                 act_key = BOOT_PRES;
                 back_act_key = BOOT_PRES;
-                lv_event_send(back_btn,LV_EVENT_CLICKED,NULL);
+                if (back_btn != NULL && lv_obj_is_valid(back_btn))
+                {
+                    lv_event_send(back_btn,LV_EVENT_CLICKED,NULL);
+                }
             
             break;
         }
@@ -414,7 +422,6 @@ static void keypad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
  */
 static uint32_t keypad_get_key(void)
 {
-    uint8_t key1;
     uint8_t key2;
 
     key2 = key_scan(0);
@@ -435,14 +442,24 @@ static uint32_t keypad_get_key(void)
  */
 void lv_port_indev_init(void)
 {
-    static lv_indev_drv_t indev_drv; 
-    tp_dev.init();
+    static lv_indev_drv_t indev_drv;
+    static lv_indev_drv_t keypad_drv;
+    esp_err_t touch_ret = tp_dev.init();
+    if (touch_ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Touch initialization failed: %s", esp_err_to_name(touch_ret));
+    }
 
 	/* 注册触摸输入设备 */
 	lv_indev_drv_init(&indev_drv);
 	indev_drv.type = LV_INDEV_TYPE_POINTER;
 	indev_drv.read_cb = touchpad_read;
 	lv_indev_drv_register(&indev_drv);
+
+    lv_indev_drv_init(&keypad_drv);
+    keypad_drv.type = LV_INDEV_TYPE_KEYPAD;
+    keypad_drv.read_cb = keypad_read;
+    indev_keypad = lv_indev_drv_register(&keypad_drv);
 }
 
 lv_disp_drv_t disp_drv;      /* 回调函数的参数 */
@@ -455,50 +472,21 @@ lv_disp_drv_t disp_drv;      /* 回调函数的参数 */
 void lvgl_demo(void)
 {
     static lv_disp_draw_buf_t disp_buf; /* 绘画区域的存储区 */
-       
-    if (sd_spi_init() == ESP_OK)        /* 初始化TF卡 */
-    {
-        lv_smail_icon_add_state(TF_STATE);
-    }
-    else
-    {
-        lv_smail_icon_clear_state(TF_STATE);
-    }
-
-	/* 创建SD卡 CS引脚控制任务 */
-    xTaskCreatePinnedToCore((TaskFunction_t )sd_task,               /* 任务函数 */
-                            (const char*    )"sd_task",             /* 任务名称 */
-                            (uint16_t       )SD_STK_SIZE,           /* 任务堆栈大小 */
-                            (void*          )NULL,                  /* 传入给任务函数的参数 */
-                            (UBaseType_t    )SD_TASK_PRIO,          /* 任务优先级 */
-                            (TaskHandle_t*  )&SDTask_Handler,       /* 任务句柄 */
-                            (BaseType_t     ) 0);                   /* 该任务哪个内核运行 */	
-
-	/* 创建UART控制任务 */
-    xTaskCreatePinnedToCore((TaskFunction_t )uart_task,             /* 任务函数 */
-							(const char*    )"uart_task",           /* 任务名称 */
-							(uint16_t       )UART_STK_SIZE,         /* 任务堆栈大小 */
-							(void*          )NULL,                  /* 传入给任务函数的参数 */
-							(UBaseType_t    )UART_TASK_PRIO,        /* 任务优先级 */
-							(TaskHandle_t*  )&UARTTask_Handler,     /* 任务句柄 */
-							(BaseType_t     ) 0);                   /* 该任务哪个内核运行 */
-
-	/* 创建KEY控制任务 */
-    xTaskCreatePinnedToCore((TaskFunction_t )key_task,               /* 任务函数 */
-                            (const char*    )"key_task",             /* 任务名称 */
-                            (uint16_t       )KEY_STK_SIZE,           /* 任务堆栈大小 */
-                            (void*          )NULL,                   /* 传入给任务函数的参数 */
-                            (UBaseType_t    )KEY_TASK_PRIO,          /* 任务优先级 */
-                            (TaskHandle_t*  )&KEYTask_Handler,       /* 任务句柄 */
-                            (BaseType_t     ) 0);                    /* 该任务哪个内核运行 */							
-						
-    lv_init();                          /* 初始化lvgl */
-
 	void *buf1 = NULL;
     void *buf2 = NULL;
 
 	buf1 = heap_caps_malloc(lcd_dev.width * 60 * sizeof(lv_color_t), MALLOC_CAP_DMA);
     buf2 = heap_caps_malloc(lcd_dev.width * 60 * sizeof(lv_color_t), MALLOC_CAP_DMA);
+
+    if (buf1 == NULL || buf2 == NULL)
+    {
+        heap_caps_free(buf1);
+        heap_caps_free(buf2);
+        ESP_LOGE(TAG, "Failed to allocate LVGL draw buffers");
+        return;
+    }
+
+    lv_init();                          /* 初始化lvgl */
 
     /* 输出内存地址 */
     ESP_LOGI(TAG, "buf1@%p, buf2@%p", buf1, buf2);
@@ -516,6 +504,14 @@ void lvgl_demo(void)
     /* 触摸设备注册 */
     lv_port_indev_init();
 
+    lvgl_mux = xSemaphoreCreateRecursiveMutex();
+    if (lvgl_mux == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to create LVGL mutex");
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+        return;
+    }
+
     /* 创建定时器提供lvgl时钟节拍 */
     const esp_timer_create_args_t lvgl_tick_timer_args = {
         .callback = &lvgl_increase_tick,
@@ -525,16 +521,60 @@ void lvgl_demo(void)
     ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, EXAMPLE_LVGL_TICK_PERIOD_MS * 1000));
 
-    lvgl_mux = xSemaphoreCreateRecursiveMutex();
-    assert(lvgl_mux);
-
-    xTaskCreatePinnedToCore(lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, EXAMPLE_LVGL_TASK_PRIORITY, NULL, 0);
+    if (sd_spi_init() == ESP_OK)        /* 初始化TF卡 */
+    {
+        lv_smail_icon_add_state(TF_STATE);
+    }
+    else
+    {
+        lv_smail_icon_clear_state(TF_STATE);
+    }
 
     /* 锁定互斥锁，因为LVGL api不是线程安全的 */
     if (lvgl_mux_lock(-1))
     {
-         lv_start_ui();
+        lv_start_ui();
         /* 释放互斥锁 */
         lvgl_mux_unlock();
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to lock LVGL mutex");
+        ESP_ERROR_CHECK(ESP_FAIL);
+        return;
+    }
+
+    BaseType_t task_result = xTaskCreatePinnedToCore(lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, EXAMPLE_LVGL_TASK_PRIORITY, NULL, 0);
+    if (task_result != pdPASS)
+    {
+        ESP_LOGE(TAG, "Failed to create LVGL task");
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+        return;
+    }
+
+    task_result = xTaskCreatePinnedToCore((TaskFunction_t )sd_task,
+                                         (const char*    )"sd_task",
+                                         (uint16_t       )SD_STK_SIZE,
+                                         (void*          )NULL,
+                                         (UBaseType_t    )SD_TASK_PRIO,
+                                         (TaskHandle_t*  )&SDTask_Handler,
+                                         (BaseType_t     ) 0);
+    if (task_result != pdPASS)
+    {
+        SDTask_Handler = NULL;
+        ESP_LOGE(TAG, "Failed to create SD task");
+    }
+
+    task_result = xTaskCreatePinnedToCore((TaskFunction_t )uart_task,
+                                         (const char*    )"uart_task",
+                                         (uint16_t       )UART_STK_SIZE,
+                                         (void*          )NULL,
+                                         (UBaseType_t    )UART_TASK_PRIO,
+                                         (TaskHandle_t*  )&UARTTask_Handler,
+                                         (BaseType_t     ) 0);
+    if (task_result != pdPASS)
+    {
+        UARTTask_Handler = NULL;
+        ESP_LOGE(TAG, "Failed to create UART task");
     }
 }

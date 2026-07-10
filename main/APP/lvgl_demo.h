@@ -38,4 +38,5 @@ void lvgl_demo(void);
 void lvgl_mux_unlock(void);
 bool lvgl_mux_lock(int timeout_ms);
 void touchpad_get_xy(lv_coord_t *x, lv_coord_t *y);
+bool lvgl_notify_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx);
 #endif

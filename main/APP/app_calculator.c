@@ -28,6 +28,17 @@ double cbp_and_negative = 0;
 /* 逻辑标志位 */
 uint8_t logical_flag_bit = 0x01;    // 标志位用于区分不同的状态
 
+static void lv_math_reset(void)
+{
+    lv_math_x1 = 0;
+    lv_math_x2 = 0;
+    lv_math_result = 0;
+    lv_math_flag = 0;
+    cbp_and_negative = 0;
+    logical_flag_bit = 0x01;
+    memset(str, 0, sizeof(str));
+}
+
 /* 按钮矩阵的布局定义 */
 static const char * btnm_map[] = {"AC", "+/-", "%", "/","\n",
                                   "7", "8", "9", "*","\n",
@@ -111,6 +122,7 @@ const char * lv_math_flag_to_operator(uint8_t lv_math_flag)
 			 }
  
 			 /* 设置默认按钮样式 */ 
+			 dsc->label_dsc->ofs_x = 0;
 			 dsc->label_dsc->color = lv_color_make(0, 0, 0); /* 黑色文字 */ 
 			 dsc->rect_dsc->bg_color = lv_color_make(168, 168, 168); /* 灰色背景 */ 
 			 dsc->rect_dsc->radius = 100; /* 圆形按钮 */ 
@@ -150,9 +162,9 @@ const char * lv_math_flag_to_operator(uint8_t lv_math_flag)
 				 dsc->label_dsc->color = lv_color_make(255, 255, 255); /* 白色文字 */ 
  
 				 /* 数字"0"按钮特殊偏移（左对齐） */ 
-				 if (dsc->id == 16) 
+				 if (dsc->id == 16 && dsc->draw_area != NULL)
 				 {
-					 dsc->label_dsc->ofs_x = -85;
+					 dsc->label_dsc->ofs_x = -lv_area_get_width(dsc->draw_area) / 4;
 				 }
 			 }
 		 }
@@ -170,12 +182,7 @@ const char * lv_math_flag_to_operator(uint8_t lv_math_flag)
 			 lv_textarea_set_text(calculator_ui.calculator_text_area, "0"); /* 重置显示为0 */ 
 			 lv_label_set_text(calculator_ui.calculator_result, "DEG"); /* 重置状态显示 */ 
 			 lv_obj_set_style_text_color(calculator_ui.calculator_result, lv_color_make(0, 0, 0), LV_STATE_DEFAULT); 
-			 /* 重置所有计算变量 */ 
-			 lv_math_x1 = 0;
-			 lv_math_x2 = 0;
-			 lv_math_result = 0;
-			 lv_math_flag = 0;
-			 logical_flag_bit = 0x01; /* 重置为初始状态 */ 
+			 lv_math_reset();
 		 }
 		 /* 等号按钮处理 */ 
 		 else if (id == 18) 
@@ -193,12 +200,12 @@ const char * lv_math_flag_to_operator(uint8_t lv_math_flag)
 			 }
  
 			 /* 格式化并显示结果 */ 
-			 sprintf(str, "%g", lv_math_result);
+			 snprintf(str, sizeof(str), "%g", lv_math_result);
 			 lv_textarea_set_text(calculator_ui.calculator_text_area, str);
 			 lv_label_set_text(calculator_ui.calculator_result, "RES"); /* 显示结果标记 */ 
 			 
 			 /* 记录计算过程 */
-			 sprintf(str, "%.2f %s %.2f = %.2f", lv_math_x1, lv_math_flag_to_operator(lv_math_flag), lv_math_x2, lv_math_result);
+			 snprintf(str, sizeof(str), "%.6g %s %.6g = %.6g", lv_math_x1, lv_math_flag_to_operator(lv_math_flag), lv_math_x2, lv_math_result);
 			 lv_label_set_text(calculator_ui.calculator_dec, str);
  
 			 lv_obj_set_style_text_color(calculator_ui.calculator_result, lv_color_make(255, 0, 0), LV_STATE_DEFAULT); 
@@ -235,7 +242,7 @@ const char * lv_math_flag_to_operator(uint8_t lv_math_flag)
 			 /* 获取当前值并取反 */ 
 			 cbp_and_negative = atof(lv_textarea_get_text(calculator_ui.calculator_text_area));
 			 cbp_and_negative = -cbp_and_negative;
-			 sprintf(str, "%g", cbp_and_negative);
+			 snprintf(str, sizeof(str), "%g", cbp_and_negative);
 			 lv_textarea_set_text(calculator_ui.calculator_text_area, str);
 		 }
 		 /* 数字和小数点按钮处理 */ 
@@ -281,6 +288,7 @@ const char * lv_math_flag_to_operator(uint8_t lv_math_flag)
   */
  void lv_app_calculator_init(void)
  {
+	 lv_math_reset();
 	/* 创建计算器主容器 */ 
 	 calculator_ui.calculator_main_ui = lv_obj_create(lv_scr_act());
 	 lv_obj_set_style_bg_color(calculator_ui.calculator_main_ui, lv_color_hex(0x000000), LV_STATE_DEFAULT); 
@@ -308,6 +316,7 @@ const char * lv_math_flag_to_operator(uint8_t lv_math_flag)
 	 calculator_ui.calculator_text_area = lv_textarea_create(calculator_ui.calculator_main_ui);
 	 lv_textarea_set_text(calculator_ui.calculator_text_area, "0"); 
 	 lv_textarea_set_one_line(calculator_ui.calculator_text_area, true); 
+	 lv_textarea_set_max_length(calculator_ui.calculator_text_area, 32);
 	 lv_textarea_set_cursor_click_pos(calculator_ui.calculator_text_area, false); 
 	 lv_obj_set_size(calculator_ui.calculator_text_area, lv_obj_get_width(lv_scr_act()) - 30, 120); 
 	 lv_obj_align_to(calculator_ui.calculator_text_area, calculator_ui.calculator_btnm, LV_ALIGN_OUT_TOP_MID, 0, -20); 

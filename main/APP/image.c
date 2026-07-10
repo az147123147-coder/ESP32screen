@@ -186,7 +186,7 @@ static uint8_t images_update_imagex(uint16_t x, uint16_t y, uint8_t size, uint8_
     FIL *fftemp;
     uint8_t *tempbuf;
     uint8_t res;
-    uint16_t bread;
+    UINT bread;
     uint32_t offx = 0;
     uint8_t rval = 0;
 
@@ -200,9 +200,7 @@ static uint8_t images_update_imagex(uint16_t x, uint16_t y, uint8_t size, uint8_
         return 1;
     }
 
-	/* 选中SD卡 */
-	SD_CS(0);
-    res = f_open(fftemp, (const TCHAR *)fpath, FA_READ);
+    res = sd_f_open(fftemp, (const TCHAR *)fpath, FA_READ);
 
     if (res) rval = 2;   /* 打开文件失败 */
 
@@ -264,7 +262,7 @@ static uint8_t images_update_imagex(uint16_t x, uint16_t y, uint8_t size, uint8_
 
         while (res == FR_OK)            /* 死循环执行 */
         {
-            res = f_read(fftemp, tempbuf, 4096, (UINT *)&bread);                /* 读取数据 */
+            res = sd_f_read(fftemp, tempbuf, 4096, &bread);                /* 读取数据 */
 
             if (res != FR_OK) break;    /* 执行错误 */
 
@@ -275,11 +273,8 @@ static uint8_t images_update_imagex(uint16_t x, uint16_t y, uint8_t size, uint8_
             if (bread != 4096) break;   /* 读完了 */
         }
 
-        f_close(fftemp);
+        sd_f_close(fftemp);
     }
-
-	/* 取消选中SD卡 */
-	SD_CS(1);
     free(fftemp);     /* 释放内存 */
     free(tempbuf);    /* 释放内存 */
     return res;
@@ -323,16 +318,12 @@ uint8_t images_update_image(uint16_t x, uint16_t y, uint8_t size, uint8_t *src, 
     {
         strcpy((char *)pname, (char *)src);                  /* copy src内容到pname */
         strcat((char *)pname, (char *)IMAGE_GBK_PATH[i]);    /* 追加具体文件路径 */
-		/* 选中SD卡 */
-	    SD_CS(0);
-        res = f_open(fftemp, (const TCHAR *)pname, FA_READ); /* 尝试打开 */
+        res = sd_f_open(fftemp, (const TCHAR *)pname, FA_READ); /* 尝试打开 */
 
         if (res == FR_OK)
         {
-            f_close(fftemp);
+            sd_f_close(fftemp);
         }
-
-        SD_CS(1);
 
         if (res)
         {
@@ -383,8 +374,6 @@ uint8_t images_update_image(uint16_t x, uint16_t y, uint8_t size, uint8_t *src, 
         images_partition_write((uint8_t *)&g_ftinfo, IMAGEINFOADDR, sizeof(g_ftinfo));    /* 保存字库信息 */
     }
 
-	/* 选中SD卡 */
-	SD_CS(1);
     free(pname);    /* 释放内存 */
     free(buf);      /* 释放内存 */
 

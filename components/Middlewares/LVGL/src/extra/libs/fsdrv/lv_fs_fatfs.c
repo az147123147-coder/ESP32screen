@@ -23,6 +23,34 @@ uint8_t fs_read_flag = 1;
 uint8_t fs_write_flag = 1;
 uint8_t fs_dir_open_flag = 1;
 uint8_t fs_dir_read_flag = 1;
+__attribute__((weak)) bool lv_fs_fatfs_access_begin(void)
+{
+    return true;
+}
+
+__attribute__((weak)) void lv_fs_fatfs_access_end(void)
+{
+}
+
+__attribute__((weak)) bool lv_fs_fatfs_session_begin(void)
+{
+    return true;
+}
+
+__attribute__((weak)) void lv_fs_fatfs_session_end(void)
+{
+}
+
+__attribute__((weak)) FRESULT lv_fs_fatfs_file_close(FIL *file_p)
+{
+    FRESULT res = FR_NOT_READY;
+    if(lv_fs_fatfs_access_begin()) {
+        res = f_close(file_p);
+        lv_fs_fatfs_access_end();
+    }
+    lv_fs_fatfs_session_end();
+    return res;
+}
 /**********************
  *      TYPEDEFS
  **********************/
@@ -114,17 +142,30 @@ static void * fs_open(lv_fs_drv_t * drv, const char * path, lv_fs_mode_t mode)
     else if(mode == LV_FS_MODE_RD) flags = FA_READ;
     else if(mode == (LV_FS_MODE_WR | LV_FS_MODE_RD)) flags = FA_READ | FA_WRITE | FA_OPEN_ALWAYS;
 
+    if(!lv_fs_fatfs_session_begin()) return NULL;
+
     FIL * f = lv_mem_alloc(sizeof(FIL));
-    if(f == NULL) return NULL;
+    if(f == NULL) {
+        lv_fs_fatfs_session_end();
+        return NULL;
+    }
+
+    if(!lv_fs_fatfs_access_begin()) {
+        lv_mem_free(f);
+        lv_fs_fatfs_session_end();
+        return NULL;
+    }
 
 	fs_open_flag = 0;
     FRESULT res = f_open(f, path, flags);
 	fs_open_flag = 1;
+    lv_fs_fatfs_access_end();
     if(res == FR_OK) {
         return f;
     }
     else {
         lv_mem_free(f);
+        lv_fs_fatfs_session_end();
         return NULL;
     }
 }
@@ -139,9 +180,9 @@ static void * fs_open(lv_fs_drv_t * drv, const char * path, lv_fs_mode_t mode)
 static lv_fs_res_t fs_close(lv_fs_drv_t * drv, void * file_p)
 {
     LV_UNUSED(drv);
-    f_close(file_p);
+    FRESULT res = lv_fs_fatfs_file_close(file_p);
     lv_mem_free(file_p);
-    return LV_FS_RES_OK;
+    return res == FR_OK ? LV_FS_RES_OK : LV_FS_RES_UNKNOWN;
 }
 
 /**
@@ -157,9 +198,16 @@ static lv_fs_res_t fs_close(lv_fs_drv_t * drv, void * file_p)
 static lv_fs_res_t fs_read(lv_fs_drv_t * drv, void * file_p, void * buf, uint32_t btr, uint32_t * br)
 {
     LV_UNUSED(drv);
+	if(!lv_fs_fatfs_access_begin()) {
+        if(br != NULL) *br = 0;
+        return LV_FS_RES_UNKNOWN;
+    }
+	UINT bytes_read = 0;
 	fs_read_flag = 0;
-    FRESULT res = f_read(file_p, buf, btr, (UINT *)br);
+    FRESULT res = f_read(file_p, buf, btr, &bytes_read);
 	fs_read_flag = 1;
+    lv_fs_fatfs_access_end();
+    if(br != NULL) *br = bytes_read;
     if(res == FR_OK) return LV_FS_RES_OK;
     else return LV_FS_RES_UNKNOWN;
 }
@@ -176,9 +224,16 @@ static lv_fs_res_t fs_read(lv_fs_drv_t * drv, void * file_p, void * buf, uint32_
 static lv_fs_res_t fs_write(lv_fs_drv_t * drv, void * file_p, const void * buf, uint32_t btw, uint32_t * bw)
 {
     LV_UNUSED(drv);
+	if(!lv_fs_fatfs_access_begin()) {
+        if(bw != NULL) *bw = 0;
+        return LV_FS_RES_UNKNOWN;
+    }
+	UINT bytes_written = 0;
 	fs_write_flag = 0;
-    FRESULT res = f_write(file_p, buf, btw, (UINT *)bw);
+    FRESULT res = f_write(file_p, buf, btw, &bytes_written);
 	fs_write_flag = 1;
+    lv_fs_fatfs_access_end();
+    if(bw != NULL) *bw = bytes_written;
     if(res == FR_OK) return LV_FS_RES_OK;
     else return LV_FS_RES_UNKNOWN;
 }
@@ -195,20 +250,23 @@ static lv_fs_res_t fs_write(lv_fs_drv_t * drv, void * file_p, const void * buf, 
 static lv_fs_res_t fs_seek(lv_fs_drv_t * drv, void * file_p, uint32_t pos, lv_fs_whence_t whence)
 {
     LV_UNUSED(drv);
+    if(!lv_fs_fatfs_access_begin()) return LV_FS_RES_UNKNOWN;
+    FRESULT res = FR_INVALID_PARAMETER;
     switch(whence) {
         case LV_FS_SEEK_SET:
-            f_lseek(file_p, pos);
+            res = f_lseek(file_p, pos);
             break;
         case LV_FS_SEEK_CUR:
-            f_lseek(file_p, f_tell((FIL *)file_p) + pos);
+            res = f_lseek(file_p, f_tell((FIL *)file_p) + pos);
             break;
         case LV_FS_SEEK_END:
-            f_lseek(file_p, f_size((FIL *)file_p) + pos);
+            res = f_lseek(file_p, f_size((FIL *)file_p) + pos);
             break;
         default:
             break;
     }
-    return LV_FS_RES_OK;
+    lv_fs_fatfs_access_end();
+    return res == FR_OK ? LV_FS_RES_OK : LV_FS_RES_UNKNOWN;
 }
 
 /**
@@ -222,7 +280,9 @@ static lv_fs_res_t fs_seek(lv_fs_drv_t * drv, void * file_p, uint32_t pos, lv_fs
 static lv_fs_res_t fs_tell(lv_fs_drv_t * drv, void * file_p, uint32_t * pos_p)
 {
     LV_UNUSED(drv);
+    if(!lv_fs_fatfs_access_begin()) return LV_FS_RES_UNKNOWN;
     *pos_p = f_tell((FIL *)file_p);
+    lv_fs_fatfs_access_end();
     return LV_FS_RES_OK;
 }
 
@@ -235,15 +295,27 @@ static lv_fs_res_t fs_tell(lv_fs_drv_t * drv, void * file_p, uint32_t * pos_p)
 static void * fs_dir_open(lv_fs_drv_t * drv, const char * path)
 {
     LV_UNUSED(drv);
+    if(!lv_fs_fatfs_session_begin()) return NULL;
     FF_DIR * d = lv_mem_alloc(sizeof(FF_DIR));
-    if(d == NULL) return NULL;
+    if(d == NULL) {
+        lv_fs_fatfs_session_end();
+        return NULL;
+    }
+
+    if(!lv_fs_fatfs_access_begin()) {
+        lv_mem_free(d);
+        lv_fs_fatfs_session_end();
+        return NULL;
+    }
 
 	fs_dir_open_flag = 0;
     FRESULT res = f_opendir(d, path);
 	fs_dir_open_flag = 1;
+    lv_fs_fatfs_access_end();
     if(res != FR_OK) {
         lv_mem_free(d);
         d = NULL;
+        lv_fs_fatfs_session_end();
     }
     return d;
 }
@@ -259,6 +331,7 @@ static void * fs_dir_open(lv_fs_drv_t * drv, const char * path)
 static lv_fs_res_t fs_dir_read(lv_fs_drv_t * drv, void * dir_p, char * fn)
 {
     LV_UNUSED(drv);
+    if(!lv_fs_fatfs_access_begin()) return LV_FS_RES_UNKNOWN;
     FRESULT res;
     FILINFO fno;
     fn[0] = '\0';
@@ -267,7 +340,10 @@ static lv_fs_res_t fs_dir_read(lv_fs_drv_t * drv, void * dir_p, char * fn)
 		fs_dir_read_flag = 0;
         res = f_readdir(dir_p, &fno);
 		fs_dir_read_flag = 1;
-        if(res != FR_OK) return LV_FS_RES_UNKNOWN;
+        if(res != FR_OK) {
+            lv_fs_fatfs_access_end();
+            return LV_FS_RES_UNKNOWN;
+        }
 
         if(fno.fattrib & AM_DIR) {
             fn[0] = '/';
@@ -277,6 +353,7 @@ static lv_fs_res_t fs_dir_read(lv_fs_drv_t * drv, void * dir_p, char * fn)
 
     } while(strcmp(fn, "/.") == 0 || strcmp(fn, "/..") == 0);
 
+    lv_fs_fatfs_access_end();
     return LV_FS_RES_OK;
 }
 
@@ -289,9 +366,14 @@ static lv_fs_res_t fs_dir_read(lv_fs_drv_t * drv, void * dir_p, char * fn)
 static lv_fs_res_t fs_dir_close(lv_fs_drv_t * drv, void * dir_p)
 {
     LV_UNUSED(drv);
-    f_closedir(dir_p);
+    FRESULT res = FR_NOT_READY;
+    if(lv_fs_fatfs_access_begin()) {
+        res = f_closedir(dir_p);
+        lv_fs_fatfs_access_end();
+    }
     lv_mem_free(dir_p);
-    return LV_FS_RES_OK;
+    lv_fs_fatfs_session_end();
+    return res == FR_OK ? LV_FS_RES_OK : LV_FS_RES_UNKNOWN;
 }
 
 #else /*LV_USE_FS_FATFS == 0*/

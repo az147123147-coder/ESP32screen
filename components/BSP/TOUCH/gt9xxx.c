@@ -19,6 +19,7 @@
 const char * gt9xxx_tag = "gt9xxx";
 i2c_master_bus_handle_t myiic1_bus_handle;     /* 总线句柄 */
 i2c_master_dev_handle_t gt9xxx_handle = NULL;
+#define GT9XXX_I2C_TIMEOUT_MS 100
 
 /* 注意: 除了GT9271支持10点触摸之外, 其他触摸芯片只支持 5点触摸 */
 uint8_t g_gt_tnum = 5;      /* 默认支持的触摸屏点数(5点触摸) */
@@ -32,6 +33,11 @@ uint8_t g_gt_tnum = 5;      /* 默认支持的触摸屏点数(5点触摸) */
  */
 esp_err_t gt9xxx_wr_reg(uint16_t reg, uint8_t *buf, uint8_t len)
 {
+    if (gt9xxx_handle == NULL || (buf == NULL && len != 0))
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     esp_err_t ret;
     uint8_t *wr_buf = malloc(2 + len);
 
@@ -46,7 +52,7 @@ esp_err_t gt9xxx_wr_reg(uint16_t reg, uint8_t *buf, uint8_t len)
 
     memcpy(wr_buf + 2, buf, len);     /* 拷贝数据至存储区当中 */
 
-    ret = i2c_master_transmit(gt9xxx_handle, wr_buf, 2 + len,-1);
+    ret = i2c_master_transmit(gt9xxx_handle, wr_buf, 2 + len, GT9XXX_I2C_TIMEOUT_MS);
 
     free(wr_buf);                      /* 发送完成释放内存 */
 
@@ -62,11 +68,16 @@ esp_err_t gt9xxx_wr_reg(uint16_t reg, uint8_t *buf, uint8_t len)
  */
 esp_err_t gt9xxx_rd_reg(uint16_t reg, uint8_t *buf, uint8_t len)
 {
+    if (gt9xxx_handle == NULL || buf == NULL || len == 0)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     uint8_t memaddr_buf[2];
     memaddr_buf[0]  = reg >> 8;
     memaddr_buf[1]  = reg & 0XFF;
 
-    return i2c_master_transmit_receive(gt9xxx_handle, memaddr_buf, sizeof(memaddr_buf), buf, len, -1);
+    return i2c_master_transmit_receive(gt9xxx_handle, memaddr_buf, sizeof(memaddr_buf), buf, len, GT9XXX_I2C_TIMEOUT_MS);
 }
 
 /**
@@ -76,6 +87,11 @@ esp_err_t gt9xxx_rd_reg(uint16_t reg, uint8_t *buf, uint8_t len)
  */
 esp_err_t myiic1_init(void)
 {
+    if (myiic1_bus_handle != NULL)
+    {
+        return ESP_OK;
+    }
+
     i2c_master_bus_config_t i2c1_bus_config = {
         .clk_source                     = I2C_CLK_SRC_DEFAULT,  /* 时钟源 */
         .i2c_port                       = I2C_NUM_1,            /* I2C端口 */
@@ -85,9 +101,7 @@ esp_err_t myiic1_init(void)
         .flags.enable_internal_pullup   = true,                 /* 内部上拉 */
     };
     /* 新建I2C总线 */
-    ESP_ERROR_CHECK(i2c_new_master_bus(&i2c1_bus_config, &myiic1_bus_handle));
-
-    return ESP_OK;
+    return i2c_new_master_bus(&i2c1_bus_config, &myiic1_bus_handle);
 }
 
 /**
@@ -97,9 +111,13 @@ esp_err_t myiic1_init(void)
  */
 esp_err_t gt9xxx_init(void)
 {
-    uint8_t temp[5];
+    uint8_t temp[5] = {0};
 
-    myiic1_init();                                  /* IIC1初始化 */
+    esp_err_t ret = myiic1_init();                                  /* IIC1初始化 */
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
 
     i2c_device_config_t gt9xxx_i2c_dev_conf = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,      /* 从机地址长度 */
@@ -107,7 +125,11 @@ esp_err_t gt9xxx_init(void)
         .device_address  = GT9XXX_DEV_ID,           /* 从机7位的地址 */
     };
     /* I2C总线上添加gt9xxx设备 */
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(myiic1_bus_handle, &gt9xxx_i2c_dev_conf, &gt9xxx_handle));
+    ret = i2c_master_bus_add_device(myiic1_bus_handle, &gt9xxx_i2c_dev_conf, &gt9xxx_handle);
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
 
     /* 以下是对CT_RST和CT_INT引脚做配置,同时会产生的时序决定了驱动IC的器件地址为0x14(某些芯片还会有另外一种时序,会使器件地址为0x5D) */
     gpio_config_t gpio_init_struct = {0};
@@ -128,7 +150,11 @@ esp_err_t gt9xxx_init(void)
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    gt9xxx_rd_reg(GT9XXX_PID_REG, temp, 4);     /* 读取产品ID */
+    ret = gt9xxx_rd_reg(GT9XXX_PID_REG, temp, 4);     /* 读取产品ID */
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
     temp[4] = 0;
     /* 判断一下是否是特定的触摸屏 */
     if (strcmp((char *)temp, "911") && strcmp((char *)temp, "9147") && strcmp((char *)temp, "1158") && strcmp((char *)temp, "9271") && strcmp((char *)temp, "928"))
@@ -143,14 +169,26 @@ esp_err_t gt9xxx_init(void)
     }
 
     temp[0] = 0X02;
-    gt9xxx_wr_reg(GT9XXX_CTRL_REG, temp, 1);    /* 软复位GT9XXX */
+    ret = gt9xxx_wr_reg(GT9XXX_CTRL_REG, temp, 1);    /* 软复位GT9XXX */
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
     
     vTaskDelay(10);
     
     temp[0] = 0X00;
-    gt9xxx_wr_reg(GT9XXX_CTRL_REG, temp, 1);    /* 结束复位, 进入读坐标状态 */
+    return gt9xxx_wr_reg(GT9XXX_CTRL_REG, temp, 1);    /* 结束复位, 进入读坐标状态 */
+}
 
-    return ESP_OK;
+static void gt9xxx_release_touch(void)
+{
+    tp_dev.sta = 0;
+    for (uint8_t i = 0; i < CT_MAX_TOUCH; i++)
+    {
+        tp_dev.x[i] = 0xFFFF;
+        tp_dev.y[i] = 0xFFFF;
+    }
 }
 
 /* GT9XXX 10个触摸点(最多) 对应的寄存器表 */
@@ -179,12 +217,20 @@ uint8_t gt9xxx_scan(uint8_t mode)
 
     if ((t % 10) == 0 || t < 10)    /* 空闲时,每进入10次CTP_Scan函数才检测1次,从而节省CPU使用率 */
     {
-        gt9xxx_rd_reg(GT9XXX_GSTID_REG, &mode, 1);              /* 读取触摸点的状态 */
+        if (gt9xxx_rd_reg(GT9XXX_GSTID_REG, &mode, 1) != ESP_OK)              /* 读取触摸点的状态 */
+        {
+            gt9xxx_release_touch();
+            return 0;
+        }
 
         if ((mode & 0X80) && ((mode & 0XF) <= g_gt_tnum))
         {
             i = 0;
-            gt9xxx_wr_reg(GT9XXX_GSTID_REG, &i, 1);             /* 清标志 */
+            if (gt9xxx_wr_reg(GT9XXX_GSTID_REG, &i, 1) != ESP_OK)             /* 清标志 */
+            {
+                gt9xxx_release_touch();
+                return 0;
+            }
         }
 
         if ((mode & 0XF) && ((mode & 0XF) <= g_gt_tnum))
@@ -199,7 +245,11 @@ uint8_t gt9xxx_scan(uint8_t mode)
             {
                 if (tp_dev.sta & (1 << i))                      /* 触摸有效? */
                 {
-                    gt9xxx_rd_reg(GT9XXX_TPX_TBL[i], buf, 4);   /* 读取XY坐标值 */
+                    if (gt9xxx_rd_reg(GT9XXX_TPX_TBL[i], buf, 4) != ESP_OK)   /* 读取XY坐标值 */
+                    {
+                        gt9xxx_release_touch();
+                        return 0;
+                    }
 
                     if (lcd_dev.dir == 0)        /* 竖屏 */
                     {
@@ -208,7 +258,7 @@ uint8_t gt9xxx_scan(uint8_t mode)
                     }
                     else                        /* 横屏 */
                     {
-                        tp_dev.x[i] = lcd_dev.width - (((uint16_t)buf[3] << 8) + buf[2]);
+                        tp_dev.x[i] = lcd_dev.width - 1 - (((uint16_t)buf[3] << 8) + buf[2]);
                         tp_dev.y[i] = ((uint16_t)buf[1] << 8) + buf[0];
                     }
                 }
@@ -218,7 +268,7 @@ uint8_t gt9xxx_scan(uint8_t mode)
 
             res = 1;
 
-            if (tp_dev.x[0] > lcd_dev.width || tp_dev.y[0] > lcd_dev.height)      /* 非法数据(坐标超出了) */
+            if (tp_dev.x[0] >= lcd_dev.width || tp_dev.y[0] >= lcd_dev.height)      /* 非法数据(坐标超出了) */
             {
                 if ((mode & 0XF) > 1)                   /* 有其他点有数据,则复第二个触点的数据到第一个触点. */
                 {

@@ -19,6 +19,19 @@
  
  /* 声明开机控件结构体 */
  static lv_starting_obj_t my_start_obj;
+
+ static void start_finish_cb(lv_timer_t *timer)
+ {
+	 (void)timer;
+	 if (my_start_obj.logo_box != NULL && lv_obj_is_valid(my_start_obj.logo_box))
+	 {
+		 lv_obj_del(my_start_obj.logo_box);
+	 }
+	 my_start_obj.logo_box = NULL;
+	 my_start_obj.logo_obj = NULL;
+	 my_start_obj.logo1_obj = NULL;
+	 lv_mian_ui();
+ }
  
  /**
   * @brief       设置缩放的回调函数
@@ -49,9 +62,13 @@
  static void anim_ready_cb(lv_anim_t *a)
  {
 	 (void)a;
-	 vTaskDelay(800);
-	 lv_obj_del(my_start_obj.logo_box);     
-	 lv_mian_ui();
+	 lv_timer_t *timer = lv_timer_create(start_finish_cb, 800, NULL);
+	 if (timer == NULL)
+	 {
+		 start_finish_cb(NULL);
+		 return;
+	 }
+	 lv_timer_set_repeat_count(timer, 1);
  }
  
  /**

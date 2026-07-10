@@ -54,6 +54,16 @@ typedef struct
 static bool photo_cache_save_enabled = false;
 static char photo_cache_path[PHOTO_CACHE_PATH_SIZE];
 static photo_cache_header_t photo_cache_header;
+static bool photo_sd_session = false;
+
+static void photo_sd_session_release(void)
+{
+    if (photo_sd_session)
+    {
+        photo_sd_session = false;
+        sd_local_session_end();
+    }
+}
 
 /**
  * @brief       Obtain the total number of target files in the path path
@@ -67,9 +77,7 @@ uint16_t pic_get_tnum(char *path)
     FF_DIR tdir;
     FILINFO *tfileinfo;
     tfileinfo = (FILINFO *)malloc(sizeof(FILINFO));
-	/* 选中SD卡 */
-	SD_CS(0);
-    res = f_opendir(&tdir, (const TCHAR *)path);
+    res = sd_f_opendir(&tdir, (const TCHAR *)path);
 
     if (res == FR_OK)
     {
@@ -77,7 +85,7 @@ uint16_t pic_get_tnum(char *path)
         {
             while (1)
             {
-                res = f_readdir(&tdir, tfileinfo);
+                res = sd_f_readdir(&tdir, tfileinfo);
 
                 if (res != FR_OK || tfileinfo->fname[0] == 0)break;
                 res = exfuns_file_type(tfileinfo->fname);
@@ -89,11 +97,8 @@ uint16_t pic_get_tnum(char *path)
             }
         }
 
-        f_closedir(&tdir);
+        sd_f_closedir(&tdir);
     }
-
-	/* 取消选中SD卡 */
-	SD_CS(1);
     free(tfileinfo);
     return rval;
 }
@@ -184,6 +189,10 @@ lv_img_dsc_t img_pic_dsc = {
 static uint8_t *photo_img_buf = NULL;
 static volatile bool photo_decode_ok = false;
 static volatile bool photo_switching = false;
+static volatile bool photo_closing = false;
+static lv_timer_t *photo_close_timer = NULL;
+static void photo_finish_close(void);
+static void photo_close_timer_cb(lv_timer_t *timer);
 
 static void photo_sd_lost(void)
 {
@@ -272,9 +281,7 @@ static bool lv_photo_get_src_info(const char *src, uint32_t *src_size, uint16_t 
     FILINFO info;
     FRESULT res;
 
-    SD_CS(0);
-    res = f_stat(src, &info);
-    SD_CS(1);
+    res = sd_f_stat(src, &info);
 
     if (res != FR_OK)
     {
@@ -374,44 +381,41 @@ static void lv_photo_cache_save(uint16_t w, uint16_t h, const uint8_t *buf)
         return;
     }
 
-    SD_CS(0);
-    res = f_open(fp, photo_cache_path, FA_WRITE | FA_CREATE_ALWAYS);
+    res = sd_f_open(fp, photo_cache_path, FA_WRITE | FA_CREATE_ALWAYS);
 
     if (res == FR_OK)
     {
-        res = f_write(fp, &invalid_header, sizeof(invalid_header), &bw);
+        res = sd_f_write(fp, &invalid_header, sizeof(invalid_header), &bw);
 
         if (res == FR_OK && bw == sizeof(invalid_header))
         {
             bw = 0;
-            res = f_write(fp, buf, header.data_size, &bw);
+            res = sd_f_write(fp, buf, header.data_size, &bw);
         }
 
         if (res == FR_OK && bw == header.data_size)
         {
-            res = f_sync(fp);
+            res = sd_f_sync(fp);
         }
 
         if (res == FR_OK)
         {
-            res = f_lseek(fp, 0);
+            res = sd_f_lseek(fp, 0);
 
             if (res == FR_OK)
             {
                 bw = 0;
-                res = f_write(fp, &header, sizeof(header), &bw);
+                res = sd_f_write(fp, &header, sizeof(header), &bw);
             }
 
             if (res == FR_OK && bw == sizeof(header))
             {
-                res = f_sync(fp);
+                res = sd_f_sync(fp);
             }
         }
 
-        f_close(fp);
+        sd_f_close(fp);
     }
-
-    SD_CS(1);
     free(fp);
 }
 
@@ -444,24 +448,19 @@ static bool lv_photo_cache_load(const char *src, uint16_t target_w, uint16_t tar
         return false;
     }
 
-    SD_CS(0);
-    res = f_open(fp, photo_cache_path, FA_READ);
+    res = sd_f_open(fp, photo_cache_path, FA_READ);
 
     if (res == FR_OK)
     {
         opened = true;
-        res = f_read(fp, &header, sizeof(header), &br);
+        res = sd_f_read(fp, &header, sizeof(header), &br);
     }
-
-    SD_CS(1);
 
     if (res != FR_OK || br != sizeof(header) || !lv_photo_cache_header_valid(&header, target_w, target_h, src_size, src_date, src_time))
     {
         if (opened)
         {
-            SD_CS(0);
-            f_close(fp);
-            SD_CS(1);
+            sd_f_close(fp);
         }
         free(fp);
         return false;
@@ -471,9 +470,7 @@ static bool lv_photo_cache_load(const char *src, uint16_t target_w, uint16_t tar
 
     if ((uint32_t)f_size(fp) != expected_file_size)
     {
-        SD_CS(0);
-        f_close(fp);
-        SD_CS(1);
+        sd_f_close(fp);
         free(fp);
         return false;
     }
@@ -481,17 +478,13 @@ static bool lv_photo_cache_load(const char *src, uint16_t target_w, uint16_t tar
     buf = (uint8_t *)malloc(header.data_size);
     if (buf == NULL)
     {
-        SD_CS(0);
-        f_close(fp);
-        SD_CS(1);
+        sd_f_close(fp);
         free(fp);
         return false;
     }
 
-    SD_CS(0);
-    res = f_read(fp, buf, header.data_size, &br);
-    f_close(fp);
-    SD_CS(1);
+    res = sd_f_read(fp, buf, header.data_size, &br);
+    sd_f_close(fp);
     free(fp);
 
     if (res != FR_OK || br != header.data_size)
@@ -588,14 +581,13 @@ static bool lv_photo_get_file_by_index(uint16_t index)
     uint16_t count = 0;
     bool found = false;
 
-    SD_CS(0);
-    res = f_opendir(&dir, "0:/PICTURE");
+    res = sd_f_opendir(&dir, "0:/PICTURE");
 
     if (res == FR_OK)
     {
         while (1)
         {
-            res = f_readdir(&dir, photo_cfig.pic_picfileinfo);
+            res = sd_f_readdir(&dir, photo_cfig.pic_picfileinfo);
 
             if (res != FR_OK)
             {
@@ -624,14 +616,13 @@ static bool lv_photo_get_file_by_index(uint16_t index)
             count++;
         }
 
-        f_closedir(&dir);
+        sd_f_closedir(&dir);
     }
     else
     {
         photo_sd_lost();
     }
 
-    SD_CS(1);
     return found;
 }
 
@@ -647,10 +638,13 @@ void pic(void *pvParameters)
     int screen_w = 0;
     int screen_h = 0;
 
+    uint16_t consecutive_failures = 0;
+
     while(1)
     {
         if (!photo_cfig.pic_start)
         {
+            photo_sd_session_release();
             PICTask_Handler = NULL;
             vTaskDelete(NULL);
         }
@@ -745,7 +739,21 @@ void pic(void *pvParameters)
                 if (!photo_decode_ok)
                 {
                     photo_switching = false;
+                    consecutive_failures++;
                     photo_cfig.pic_curindex++;
+
+                    if (consecutive_failures >= photo_cfig.pic_totpicnum)
+                    {
+                        photo_cfig.pic_start = 0;
+                        photo_sd_session_release();
+                        if (!photo_closing && lvgl_mux_lock(200))
+                        {
+                            lv_msgbox("No decodable images");
+                            lvgl_mux_unlock();
+                        }
+                        PICTask_Handler = NULL;
+                        vTaskDelete(NULL);
+                    }
 
                     if (photo_cfig.pic_curindex >= photo_cfig.pic_totpicnum)
                     {
@@ -755,6 +763,7 @@ void pic(void *pvParameters)
                     vTaskDelay(10);
                     continue;
                 }
+                consecutive_failures = 0;
             }
 
             while (photo_cfig.pic_start)
@@ -841,26 +850,30 @@ void lv_photo_ui(void)
         return ;
     }
 
-    if (lv_smail_icon_get_state(TF_STATE))
+    if (!sd_local_session_begin())
+    {
+        lv_msgbox("SD device not detected");
+        return;
+    }
+    photo_sd_session = true;
+
+    if (lv_smail_icon_get_state(TF_STATE) && sd_card_is_mounted())
     {
         FRESULT res;
 
         photo_switching = false;
 
-		/* 选中SD卡 */
-	    SD_CS(0);
         photo_cfig.pic_curindex = 0;
-        res = f_opendir(&photo_cfig.picdir, "0:/PICTURE");
+        res = sd_f_opendir(&photo_cfig.picdir, "0:/PICTURE");
 
         if (res == FR_OK)
         {
-            f_closedir(&photo_cfig.picdir);
+            sd_f_closedir(&photo_cfig.picdir);
         }
-
-        SD_CS(1);
 
         if (res != FR_OK)
         {
+            photo_sd_session_release();
             lv_msgbox("PICTURE folder error");
             return ;
         }
@@ -869,6 +882,7 @@ void lv_photo_ui(void)
 
         if (photo_cfig.pic_totpicnum == 0)
         {
+            photo_sd_session_release();
             lv_msgbox("No pic files");
             return ;
         }
@@ -885,6 +899,7 @@ void lv_photo_ui(void)
             photo_cfig.pic_picfileinfo = NULL;
             photo_cfig.pic_pname = NULL;
             photo_cfig.pic_picoffsettbl = NULL;
+            photo_sd_session_release();
             lv_msgbox("memory allocation failed");
             return ;
         }
@@ -905,6 +920,8 @@ void lv_photo_ui(void)
         app_obj_general.del_parent = photo_cfig.photo_box;
         app_obj_general.APP_Function = lv_pic_del;
         app_obj_general.app_state = NOT_DEL_STATE;
+        app_obj_general.requires_sd = 1;
+        photo_closing = false;
 
         photo_cfig.photo_obj_t.photo_img = lv_img_create(photo_cfig.photo_box);
         lv_obj_set_style_bg_color(photo_cfig.photo_obj_t.photo_img, lv_color_make(50,52,67), LV_STATE_DEFAULT);
@@ -980,18 +997,27 @@ void lv_photo_ui(void)
 
         if (PICTask_Handler == NULL)
         {
-            xTaskCreatePinnedToCore((TaskFunction_t )pic,
+            BaseType_t task_result = xTaskCreatePinnedToCore((TaskFunction_t )pic,
                                     (const char*    )"pic",
                                     (uint16_t       )PIC_STK_SIZE,
                                     (void*          )NULL,
                                     (UBaseType_t    )PIC_PRIO,
                                     (TaskHandle_t*  )&PICTask_Handler,
                                     (BaseType_t     ) 1);
+            if (task_result != pdPASS)
+            {
+                photo_cfig.pic_start = 0;
+                PICTask_Handler = NULL;
+                photo_sd_session_release();
+                lv_pic_del();
+                lv_msgbox("Task creation failed");
+            }
         }
 		/* 取消选中SD卡 */
     }
     else
     {
+        photo_sd_session_release();
         lv_msgbox("SD device not detected");
     }
 }
@@ -1001,25 +1027,23 @@ void lv_photo_ui(void)
   * @param  None
   * @retval None
   */
-void lv_pic_del(void)
+static void photo_finish_close(void)
 {
+    if (photo_close_timer != NULL)
+    {
+        lv_timer_del(photo_close_timer);
+        photo_close_timer = NULL;
+    }
+
     photo_cache_save_enabled = false;
     photo_decode_ok = false;
     photo_switching = false;
     photo_cfig.pic_start = 0;
     photo_cfig.pic_state = PIC_NULL;
 
-    if (PICTask_Handler != NULL)
-    {
-        while (PICTask_Handler != NULL)
-        {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
+    photo_sd_session_release();
 
     photo_cache_save_enabled = false;
-    SD_CS(1);
-
     lv_img_cache_invalidate_src(&img_pic_dsc);
     lv_photo_free_img_buf();
 
@@ -1032,6 +1056,7 @@ void lv_pic_del(void)
     app_obj_general.del_parent = NULL;
     app_obj_general.APP_Function = NULL;
     app_obj_general.app_state = NOT_DEL_STATE;
+    app_obj_general.requires_sd = 0;
     photo_cfig.photo_obj_t.photo_img = NULL;
     photo_cfig.photo_obj_t.photo_number = NULL;
     photo_cfig.photo_obj_t.photo_pre = NULL;
@@ -1051,6 +1076,43 @@ void lv_pic_del(void)
 
     photo_cfig.pic_totpicnum = 0;
     photo_cfig.pic_curindex = 0;
+    photo_closing = false;
 
     lv_display_box();
+}
+
+static void photo_close_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    if (PICTask_Handler == NULL)
+    {
+        photo_finish_close();
+    }
+}
+
+void lv_pic_del(void)
+{
+    if (photo_closing)
+    {
+        return;
+    }
+
+    photo_closing = true;
+    photo_cache_save_enabled = false;
+    photo_switching = false;
+    photo_cfig.pic_start = 0;
+    photo_cfig.pic_state = PIC_NULL;
+
+    if (PICTask_Handler != NULL)
+    {
+        photo_close_timer = lv_timer_create(photo_close_timer_cb, 20, NULL);
+        if (photo_close_timer == NULL)
+        {
+            photo_closing = false;
+        }
+        return;
+    }
+
+    photo_finish_close();
 }

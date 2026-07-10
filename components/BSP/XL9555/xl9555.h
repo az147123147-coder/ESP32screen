@@ -13,8 +13,10 @@
 #ifndef __XL9555_H
 #define __XL9555_H
 
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "myiic.h"
 #include "string.h"

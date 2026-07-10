@@ -33,9 +33,17 @@ _m_tp_dev tp_dev =
  */
 esp_err_t tp_init(void)
 {
+    tp_dev.scan = NULL;
+    tp_dev.sta = 0;
     tp_dev.touchtype = 0;                   /* 默认设置竖屏 */
     tp_dev.touchtype |= lcd_dev.dir & 0X01; /* 根据LCD判定是横屏还是竖屏 */
-    gt9xxx_init();                          /* 初始化gt9xxx器件 */
+    esp_err_t ret = gt9xxx_init();                          /* 初始化gt9xxx器件 */
+    if (ret != ESP_OK)
+    {
+        tp_dev.x[0] = 0xFFFF;
+        tp_dev.y[0] = 0xFFFF;
+        return ret;
+    }
     tp_dev.scan = gt9xxx_scan;              /* 扫描函数指向GT触摸屏扫描 */
     tp_dev.touchtype |= 0X80;               /* 电容屏 */
     return ESP_OK;

@@ -55,6 +55,8 @@ void tud_mount_cb(void)
 void tud_umount_cb(void)
 {
     g_usbdev.status &= (uint8_t)~0x01;
+    s_disk_block_size = 0;
+    sd_usb_release_ownership();
     ESP_LOGW(__func__, "");
 }
 
@@ -65,7 +67,7 @@ void tud_umount_cb(void)
  */
 void tud_suspend_cb(bool remote_wakeup_en)
 {
-    g_usbdev.status &= 0x00;
+    (void)remote_wakeup_en;
     ESP_LOGW(__func__, "");
 }
 
@@ -90,6 +92,12 @@ void tud_msc_write10_complete_cb(uint8_t lun)
     {
         ESP_LOGE(__func__, "invalid lun number %u", lun);
         return;
+    }
+
+    if (sd_usb_access_begin(pdMS_TO_TICKS(1000)))
+    {
+        disk_ioctl(s_pdrv, CTRL_SYNC, NULL);
+        sd_usb_access_end();
     }
 
     /* 此写入完成，启动自动重新加载时钟 */
@@ -121,13 +129,19 @@ static bool _msc_sd_ready(uint8_t lun)
         return false;
     }
 
-    if (_logical_disk_ejected() || !sd_card_is_mounted())
+    if (_logical_disk_ejected() || !sd_card_is_available())
     {
         tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
         return false;
     }
 
-    if (VIDEOTask_Handler != NULL || PICTask_Handler != NULL || app_file_sd_busy)
+    if (!sd_usb_has_ownership() && (VIDEOTask_Handler != NULL || PICTask_Handler != NULL || app_file_sd_busy))
+    {
+        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x04, 0x01);
+        return false;
+    }
+
+    if (!sd_usb_has_ownership() && sd_usb_take_ownership() != ESP_OK)
     {
         tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x04, 0x01);
         return false;
@@ -215,10 +229,19 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_siz
         return;
     }
 
-	SD_CS(0);
+    if (!sd_usb_access_begin(pdMS_TO_TICKS(1000)))
+    {
+        *block_count = 0;
+        *block_size = 0;
+        s_disk_block_size = 0;
+        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x04, 0x01);
+        return;
+    }
+
     DRESULT count_res = disk_ioctl(s_pdrv, GET_SECTOR_COUNT, block_count);
     DRESULT size_res = disk_ioctl(s_pdrv, GET_SECTOR_SIZE, block_size);
-    s_disk_block_size = *block_size;
+    sd_usb_access_end();
+    s_disk_block_size = (count_res == RES_OK && size_res == RES_OK) ? *block_size : 0;
     if (count_res != RES_OK || size_res != RES_OK || s_disk_block_size <= 0)
     {
         *block_count = 0;
@@ -227,8 +250,6 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_siz
         tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
     }
     ESP_LOGD(__func__, "GET_SECTOR_COUNT = %"PRIu32"，GET_SECTOR_SIZE = %d", *block_count, *block_size);
-	/* 取消选中SD卡 */
-	SD_CS(1);
 }
 
 /**
@@ -262,7 +283,7 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
         return false;
     }
 
-    if (!sd_card_is_mounted())
+    if (!sd_card_is_available())
     {
         ejected[lun] = true;
         tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
@@ -273,43 +294,40 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
     {
         if (!start)
         {
-			/* 选中SD卡 */
-	        SD_CS(0);
-            /* 弹出磁盘 */
-            if (disk_ioctl(s_pdrv, CTRL_SYNC, NULL) != RES_OK)
+            if (!_msc_sd_ready(lun) || !sd_usb_access_begin(pdMS_TO_TICKS(1000)))
             {
-				/* 取消选中SD卡 */
-	            SD_CS(1);
                 return false;
             }
-            else
+            DRESULT sync_result = disk_ioctl(s_pdrv, CTRL_SYNC, NULL);
+            sd_usb_access_end();
+            if (sync_result != RES_OK)
             {
-				/* 取消选中SD卡 */
-	            SD_CS(1);
-                ejected[lun] = true;
+                return false;
             }
+            ejected[lun] = true;
+            s_disk_block_size = 0;
+            sd_usb_release_ownership();
         }
         else
         {
             /* 只有在它没有弹出的情况下才能加载 */
-            return !ejected[lun] && sd_card_is_mounted();
+            return !ejected[lun] && _msc_sd_ready(lun);
         }
     }
     else
     {
         if (!start)
         {
-			/* 选中SD卡 */
-			SD_CS(0);
-            /* 停止装置，但不弹出 */
-            if (disk_ioctl(s_pdrv, CTRL_SYNC, NULL) != RES_OK)
+            if (!_msc_sd_ready(lun) || !sd_usb_access_begin(pdMS_TO_TICKS(1000)))
             {
-				/* 取消选中SD卡 */
-	            SD_CS(1);
                 return false;
             }
-
-            SD_CS(1);
+            DRESULT sync_result = disk_ioctl(s_pdrv, CTRL_SYNC, NULL);
+            sd_usb_access_end();
+            if (sync_result != RES_OK)
+            {
+                return false;
+            }
         }
 
         /* 始终启动设备，即使弹出 */
@@ -329,29 +347,33 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
  */
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize)
 {
-    (void) offset;
-
     if (!_msc_sd_ready(lun) || s_disk_block_size <= 0)
     {
-        return 0;
+        return -1;
     }
 
     ESP_LOGD(__func__, "");
 
-	/* 选中SD卡 */
-	SD_CS(0);
+    if (offset != 0 || buffer == NULL || bufsize == 0 || bufsize % (uint32_t)s_disk_block_size != 0)
+    {
+        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
+        return -1;
+    }
+
+    if (!sd_usb_access_begin(pdMS_TO_TICKS(1000)))
+    {
+        return -1;
+    }
 
     const uint32_t block_count = bufsize / s_disk_block_size;
     /* 磁盘读取 */
     DRESULT res = disk_read(s_pdrv, buffer, lba, block_count);
-
-	/* 取消选中SD卡 */
-	SD_CS(1);
+    sd_usb_access_end();
 
     if (res != RES_OK)
     {
         tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);
-        return 0;
+        return -1;
     }
 
     return block_count * s_disk_block_size;
@@ -370,25 +392,29 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
 {
     if (!_msc_sd_ready(lun) || s_disk_block_size <= 0)
     {
-        return 0;
+        return -1;
     }
 
     ESP_LOGD(__func__, "");
-    (void) offset;
+    if (offset != 0 || buffer == NULL || bufsize == 0 || bufsize % (uint32_t)s_disk_block_size != 0)
+    {
+        tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x24, 0x00);
+        return -1;
+    }
 
-	/* 选中SD卡 */
-	SD_CS(0);
+    if (!sd_usb_access_begin(pdMS_TO_TICKS(1000)))
+    {
+        return -1;
+    }
     const uint32_t block_count = bufsize / s_disk_block_size;
     /* 磁盘写入 */
     DRESULT res = disk_write(s_pdrv, buffer, lba, block_count);
-
-	/* 取消选中SD卡 */
-	SD_CS(1);
+    sd_usb_access_end();
 
     if (res != RES_OK)
     {
         tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x0C, 0x00);
-        return 0;
+        return -1;
     }
 
     return block_count * s_disk_block_size;
@@ -414,7 +440,7 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, u
     }
 
     void const *response = NULL;
-    uint16_t resplen = 0;
+    int32_t resplen = 0;
 
     /* 处理的大多数scsi都是输入 */
     bool in_xfer = true;
@@ -436,6 +462,11 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, u
     }
 
     /* resplen不得大于bufsize */
+    if (resplen < 0)
+    {
+        return -1;
+    }
+
     if (resplen > bufsize)
     {
         /* 如果大于，则resplen = bufsize */

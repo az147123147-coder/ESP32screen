@@ -41,12 +41,12 @@ static uint8_t *frame_buffer                           = NULL;
 static PingPongBuffer_t *ppbuffer_handle               = NULL;
 static uint16_t current_width                          = 0;
 static uint16_t current_height                         = 0;
-static bool if_ppbuffer_init                           = false;
+static volatile bool if_ppbuffer_init                  = false;
 extern lv_obj_t * back_btn;
 
 uint32_t pictureNumber = 0;
 uint8_t res = 0;
-size_t writelen = 0;
+UINT writelen = 0;
 FIL *fftemp;
 char file_name[30];
 
@@ -68,57 +68,67 @@ static int esp_jpeg_decoder_one_picture(uint8_t *input_buf, int len, uint8_t *ou
 
     /* jpeg解码器的空句柄 */
     jpeg_dec_handle_t jpeg_dec = NULL;
+    jpeg_dec_io_t *jpeg_io = NULL;
+    jpeg_dec_header_info_t *out_info = NULL;
 
     if ((usb_camera.usb_start & 0x02) != 0)
     {
         sprintf(file_name, "0:/PICTURE/img%ld.JPG", pictureNumber);
         fftemp = (FIL *)calloc(1,sizeof(FIL));
 
-		/* 选中SD卡 */
-	    SD_CS(0);
-        res = f_open(fftemp, (const TCHAR *)file_name, FA_WRITE | FA_CREATE_NEW);
-
-        if (res != FR_OK)
+        if (fftemp == NULL)
         {
-            ESP_LOGE(TAG, "img open err\r\n");
-        }
-
-        f_write(fftemp, (const void *)input_buf, len, &writelen);
-
-        if (writelen != len)
-        {
-            ESP_LOGE(TAG, "img Write err");
+            ESP_LOGE(TAG, "img alloc err\r\n");
         }
         else
         {
-            ESP_LOGI(TAG, "write buff len %d byte", writelen);
-            pictureNumber++;
+            res = sd_f_open(fftemp, (const TCHAR *)file_name, FA_WRITE | FA_CREATE_NEW);
+            if (res != FR_OK)
+            {
+                ESP_LOGE(TAG, "img open err\r\n");
+            }
+            else
+            {
+                res = sd_f_write(fftemp, (const void *)input_buf, len, &writelen);
+                FRESULT close_res = sd_f_close(fftemp);
+                if (res != FR_OK || writelen != len || close_res != FR_OK)
+                {
+                    ESP_LOGE(TAG, "img Write err");
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "write buff len %d byte", writelen);
+                    pictureNumber++;
+                }
+            }
+            free(fftemp);
         }
-
-		/* 取消选中SD卡 */
-	    SD_CS(1);
-        f_close(fftemp);
-        free(fftemp);
         usb_camera.usb_start &= 0xFD;
     }
     
     /* 创建jpeg解码 */
     jpeg_dec = jpeg_dec_open(&config);
+    if (jpeg_dec == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
 
     /* 创建io回调句柄 */
-    jpeg_dec_io_t *jpeg_io = calloc(1, sizeof(jpeg_dec_io_t));
+    jpeg_io = calloc(1, sizeof(jpeg_dec_io_t));
 
     if (jpeg_io == NULL)
     {
-        return ESP_FAIL;
+        ret = ESP_ERR_NO_MEM;
+        goto _exit;
     }
 
     /* 创建输出信息句柄 */
-    jpeg_dec_header_info_t *out_info = calloc(1, sizeof(jpeg_dec_header_info_t));
+    out_info = calloc(1, sizeof(jpeg_dec_header_info_t));
 
     if (out_info == NULL)
     {
-        return ESP_FAIL;
+        ret = ESP_ERR_NO_MEM;
+        goto _exit;
     }
     /* 设置输入缓冲区和缓冲区len为io_callback */
     jpeg_io->inbuf = input_buf;
@@ -147,7 +157,10 @@ static int esp_jpeg_decoder_one_picture(uint8_t *input_buf, int len, uint8_t *ou
 
 _exit:
     /* 反初始化解码器 */
-    jpeg_dec_close(jpeg_dec);
+    if (jpeg_dec != NULL)
+    {
+        jpeg_dec_close(jpeg_dec);
+    }
     free(out_info);
     free(jpeg_io);
     return ret;
@@ -178,25 +191,38 @@ static void lv_phtbtn_control_event_handler(lv_event_t *event)
  * @param       length       :大小
  * @retval      无
  */
-static void adaptive_jpg_frame_buffer(size_t length)
+static esp_err_t adaptive_jpg_frame_buffer(size_t length)
 {
-    if (jpg_frame_buf1 != NULL)
+    uint8_t *new_buf1 = (uint8_t *)heap_caps_aligned_alloc(16, length, MALLOC_CAP_SPIRAM);
+    if (new_buf1 == NULL)
     {
-        free(jpg_frame_buf1);
+        return ESP_ERR_NO_MEM;
     }
 
-    if (jpg_frame_buf2 != NULL)
+    uint8_t *new_buf2 = (uint8_t *)heap_caps_aligned_alloc(16, length, MALLOC_CAP_SPIRAM);
+    if (new_buf2 == NULL)
     {
-        free(jpg_frame_buf2);
+        free(new_buf1);
+        return ESP_ERR_NO_MEM;
     }
-    /* 申请内存 */
-    jpg_frame_buf1 = (uint8_t *)heap_caps_aligned_alloc(16, length, MALLOC_CAP_SPIRAM);
-    assert(jpg_frame_buf1 != NULL);
-    jpg_frame_buf2 = (uint8_t *)heap_caps_aligned_alloc(16, length, MALLOC_CAP_SPIRAM);
-    assert(jpg_frame_buf2 != NULL);
-    /* 申请ppbuffer存储区域 */
-    ESP_ERROR_CHECK(ppbuffer_create(ppbuffer_handle, jpg_frame_buf2, jpg_frame_buf1));
+
+    bool previous_init = if_ppbuffer_init;
+    if_ppbuffer_init = false;
+    esp_err_t ret = ppbuffer_create(ppbuffer_handle, new_buf2, new_buf1);
+    if (ret != ESP_OK)
+    {
+        free(new_buf2);
+        free(new_buf1);
+        if_ppbuffer_init = previous_init;
+        return ret;
+    }
+
+    free(jpg_frame_buf1);
+    free(jpg_frame_buf2);
+    jpg_frame_buf1 = new_buf1;
+    jpg_frame_buf2 = new_buf2;
     if_ppbuffer_init = true;
+    return ESP_OK;
 }
 
 /**
@@ -207,19 +233,36 @@ static void adaptive_jpg_frame_buffer(size_t length)
  */
 static void camera_frame_cb(uvc_frame_t *frame, void *ptr)
 {
-    if (current_width != frame->width || current_height != frame->height)
+    (void)ptr;
+
+    if (frame == NULL || frame->data == NULL || frame->width == 0 || frame->height == 0)
     {
-        current_width = frame->width;
-        current_height = frame->height;
-        adaptive_jpg_frame_buffer(current_width * current_height * 2);
+        return;
     }
 
-    static void *jpeg_buffer = NULL;
+    if (!if_ppbuffer_init || current_width != frame->width || current_height != frame->height)
+    {
+        esp_err_t ret = adaptive_jpg_frame_buffer((size_t)frame->width * frame->height * 2);
+        if (ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "camera frame buffer allocation failed: %s", esp_err_to_name(ret));
+            return;
+        }
+        current_width = frame->width;
+        current_height = frame->height;
+    }
+
+    void *jpeg_buffer = NULL;
     /* 获取可写缓冲区 */
-    ppbuffer_get_write_buf(ppbuffer_handle, &jpeg_buffer);
-    assert(jpeg_buffer != NULL);
+    if (ppbuffer_get_write_buf(ppbuffer_handle, &jpeg_buffer) != ESP_OK || jpeg_buffer == NULL)
+    {
+        return;
+    }
     /* JPEG解码 */
-    esp_jpeg_decoder_one_picture((uint8_t *)frame->data, frame->data_bytes, jpeg_buffer);
+    if (esp_jpeg_decoder_one_picture((uint8_t *)frame->data, frame->data_bytes, jpeg_buffer) != ESP_OK)
+    {
+        return;
+    }
     /* 通知缓冲区写完成 */
     ppbuffer_set_write_done(ppbuffer_handle);
     vTaskDelay(pdMS_TO_TICKS(1));
@@ -247,28 +290,38 @@ static void usb_display_task(void *arg)
     pictureNumber = pic_get_tnum("0:/PICTURE");
     pictureNumber = pictureNumber + 1;
 
-    while (usb_camera.usb_state == 0x00)
-    {
-        vTaskDelay(1);
-    }
-
     while (1)
     {
+        if (usb_camera.usb_state == 0x00 ||
+            (usb_camera.usb_start & 0x01) == 0 ||
+            !if_ppbuffer_init)
+        {
+            vTaskDelay(1);
+            continue;
+        }
+
+        lcd_buffer = NULL;
         /* 获取可读缓冲区 */
         if (ppbuffer_get_read_buf(ppbuffer_handle, (void *)&lcd_buffer) == ESP_OK)
         {
-            if (current_width == lcd_dev.width && current_height <= lcd_dev.height)
+            if (lcd_buffer != NULL && current_width == lcd_dev.width && current_height <= lcd_dev.height)
             {
-                while (usb_camera.usb_state == 0x00)
+                if (lvgl_mux_lock(100))
                 {
-                    vTaskDelay(1);
+                    if (usb_camera.usb_state != 0x00 &&
+                        (usb_camera.usb_start & 0x01) != 0 &&
+                        usb_camera.camera_buf.camera_header != NULL &&
+                        lv_obj_is_valid(usb_camera.camera_buf.camera_header))
+                    {
+                        img_dsc.header.w = current_width;
+                        img_dsc.header.h = current_height;
+                        img_dsc.data_size = current_width * current_height * 2;
+                        img_dsc.data = (const uint8_t *)lcd_buffer;
+                        lv_img_set_src(usb_camera.camera_buf.camera_header, &img_dsc);
+                        lv_refr_now(NULL);
+                    }
+                    lvgl_mux_unlock();
                 }
-
-                img_dsc.header.w = current_width;
-                img_dsc.header.h = current_height;
-                img_dsc.data_size = current_width * current_height * 2;
-                img_dsc.data = (const uint8_t *)lcd_buffer;
-                lv_img_set_src(usb_camera.camera_buf.camera_header,&img_dsc);
             }
             /* 通知缓冲区读完成 */
             ppbuffer_set_read_done(ppbuffer_handle);
@@ -285,11 +338,6 @@ static void usb_display_task(void *arg)
                 count_start_time = esp_timer_get_time();
                 ESP_LOGI(TAG, "camera fps: %d %d*%d", fps, current_width, current_height);
             }
-        }
-
-        while (usb_camera.usb_state == 0x00 && usb_camera.usb_start == 0x01)
-        {
-            vTaskDelay(10);
         }
 
         vTaskDelay(1);
@@ -447,30 +495,46 @@ static void usb_stream_state_changed_cd(usb_stream_state_t event,void *arg)
     {
         /* 连接状态 */
         case STREAM_CONNECTED:
-            
+            usb_camera.usb_state = 0x00;
             lv_smail_icon_add_state(USB_STATE);
             
             /* 获取相机分辨率，并存储至nvs分区 */
             size_t size = sizeof(camera_frame_size_t);
             usb_get_value_from_nvs(DEMO_KEY_RESOLUTION, &camera_resolution_info.camera_frame_size, &size);
             size_t frame_index = 0;
-            uvc_frame_size_list_get(NULL, &camera_resolution_info.camera_frame_list_num, NULL);
+            size_t frame_list_num = 0;
+            esp_err_t list_ret = uvc_frame_size_list_get(NULL, &frame_list_num, NULL);
 
-            if (camera_resolution_info.camera_frame_list_num)
+            if (list_ret == ESP_OK && frame_list_num > 0)
             {
-                ESP_LOGI(TAG, "UVC: get frame list size = %u, current = %u", camera_resolution_info.camera_frame_list_num, frame_index);
-                uvc_frame_size_t *_frame_list = (uvc_frame_size_t *)malloc(camera_resolution_info.camera_frame_list_num * sizeof(uvc_frame_size_t));
-
-                camera_resolution_info.camera_frame_list = (uvc_frame_size_t *)realloc(camera_resolution_info.camera_frame_list, camera_resolution_info.camera_frame_list_num * sizeof(uvc_frame_size_t));
-                
-                if (NULL == camera_resolution_info.camera_frame_list)
+                ESP_LOGI(TAG, "UVC: get frame list size = %u, current = %u", frame_list_num, frame_index);
+                uvc_frame_size_t *_frame_list = (uvc_frame_size_t *)malloc(frame_list_num * sizeof(uvc_frame_size_t));
+                if (_frame_list == NULL)
                 {
-                    ESP_LOGE(TAG, "camera_resolution_info.camera_frame_list");
+                    ESP_LOGE(TAG, "camera source frame list allocation failed");
+                    break;
                 }
 
-                uvc_frame_size_list_get(_frame_list, NULL, NULL);
+                list_ret = uvc_frame_size_list_get(_frame_list, NULL, NULL);
+                if (list_ret != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "camera source frame list read failed: %s", esp_err_to_name(list_ret));
+                    free(_frame_list);
+                    break;
+                }
 
-                for (size_t i = 0; i < camera_resolution_info.camera_frame_list_num; i++)
+                uvc_frame_size_t *resized_list = (uvc_frame_size_t *)realloc(
+                    camera_resolution_info.camera_frame_list,
+                    frame_list_num * sizeof(uvc_frame_size_t));
+                if (resized_list == NULL)
+                {
+                    ESP_LOGE(TAG, "camera filtered frame list allocation failed");
+                    free(_frame_list);
+                    break;
+                }
+                camera_resolution_info.camera_frame_list = resized_list;
+
+                for (size_t i = 0; i < frame_list_num; i++)
                 {
                     if (_frame_list[i].width <= lcd_dev.width && _frame_list[i].height <= lcd_dev.height)
                     {
@@ -482,7 +546,14 @@ static void usb_stream_state_changed_cd(usb_stream_state_t event,void *arg)
                         ESP_LOGI(TAG, "\tdrop frame[%u] = %ux%u", i, _frame_list[i].width, _frame_list[i].height);
                     }
                 }
+                free(_frame_list);
                 camera_resolution_info.camera_frame_list_num = frame_index;
+
+                if (camera_resolution_info.camera_frame_list_num == 0)
+                {
+                    ESP_LOGE(TAG, "camera has no supported display resolution");
+                    break;
+                }
 
                 if(camera_resolution_info.camera_frame_size.width != 0 && camera_resolution_info.camera_frame_size.height != 0) {
                     camera_resolution_info.camera_currect_frame_index = usb_camera_find_current_resolution(&camera_resolution_info.camera_frame_size);
@@ -492,36 +563,44 @@ static void usb_stream_state_changed_cd(usb_stream_state_t event,void *arg)
                     camera_resolution_info.camera_currect_frame_index = 0;
                 }
 
-                if (-1 == camera_resolution_info.camera_currect_frame_index)
+                if (camera_resolution_info.camera_currect_frame_index >= camera_resolution_info.camera_frame_list_num)
                 {
                     ESP_LOGE(TAG, "fine current resolution fail");
                     break;
                 }
-                ESP_ERROR_CHECK(uvc_frame_size_reset(camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].width,
-                                                    camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].height, FPS2INTERVAL(30)));
+                esp_err_t reset_ret = uvc_frame_size_reset(camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].width,
+                                                           camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].height,
+                                                           FPS2INTERVAL(30));
+                if (reset_ret != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "camera resolution reset failed: %s", esp_err_to_name(reset_ret));
+                    break;
+                }
                 camera_frame_size_t camera_frame_size = {
                     .width = camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].width,
                     .height = camera_resolution_info.camera_frame_list[camera_resolution_info.camera_currect_frame_index].height,
                 };
 
-                ESP_ERROR_CHECK(usb_set_value_to_nvs(DEMO_KEY_RESOLUTION, &camera_frame_size, sizeof(camera_frame_size_t)));
-
-                if (_frame_list != NULL)
+                esp_err_t nvs_ret = usb_set_value_to_nvs(DEMO_KEY_RESOLUTION, &camera_frame_size, sizeof(camera_frame_size_t));
+                if (nvs_ret != ESP_OK)
                 {
-                    free(_frame_list);
+                    ESP_LOGW(TAG, "camera resolution save failed: %s", esp_err_to_name(nvs_ret));
                 }
                 /* 等待USB摄像头连接 */
-                usb_streaming_control(STREAM_UVC, CTRL_RESUME, NULL);
+                esp_err_t resume_ret = usb_streaming_control(STREAM_UVC, CTRL_RESUME, NULL);
+                if (resume_ret != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "camera stream resume failed: %s", esp_err_to_name(resume_ret));
+                    break;
+                }
             }
             else
             {
-                ESP_LOGW(TAG, "UVC: get frame list size = %u", camera_resolution_info.camera_frame_list_num);
+                ESP_LOGW(TAG, "UVC: get frame list failed: %s, size = %u", esp_err_to_name(list_ret), frame_list_num);
+                break;
             }
 
-            if (usb_camera.usb_start == 0x01)
-            {
-                usb_camera.usb_state = 0x01;
-            }
+            usb_camera.usb_state = 0x01;
 
             /* 设备连接成功 */
             ESP_LOGI(TAG, "Device connected");
@@ -547,6 +626,10 @@ static void usb_stream_state_changed_cd(usb_stream_state_t event,void *arg)
 esp_err_t usb_camera_init(void)
 {
     usb_camera.usb_state = 0x00;
+    usb_camera.usb_start = 0x00;
+    if_ppbuffer_init = false;
+    current_width = 0;
+    current_height = 0;
 
     /* 申请USB双缓冲 */
     xfer_buffer_a = (uint8_t *)malloc(DEMO_UVC_XFER_BUFFER_SIZE);
@@ -559,7 +642,7 @@ esp_err_t usb_camera_init(void)
     assert(frame_buffer != NULL);
 
     /* 为ppbuffer_handle句柄申请缓冲 */
-    ppbuffer_handle = (PingPongBuffer_t *)malloc(sizeof(PingPongBuffer_t));
+    ppbuffer_handle = (PingPongBuffer_t *)calloc(1, sizeof(PingPongBuffer_t));
     assert(ppbuffer_handle != NULL);
 
     /* 显示摄像头图形 */
@@ -584,7 +667,7 @@ esp_err_t usb_camera_init(void)
  */
 void usb_camera_ui(void)
 {
-    if (lv_smail_icon_get_state(USB_STATE))
+    if (lv_smail_icon_get_state(USB_STATE) && usb_camera.usb_state != 0x00)
     {
         /* 隐藏box */
         lv_hidden_box();
@@ -619,7 +702,6 @@ void usb_camera_ui(void)
         }
 
         lv_obj_move_foreground(back_btn);
-        usb_camera.usb_state = 0x01;
         usb_camera.usb_start = 0x01;
         app_obj_general.del_parent = usb_camera.usb_camera_box;
         app_obj_general.APP_Function = lv_camera_del;
@@ -639,18 +721,16 @@ void usb_camera_ui(void)
  */
 void lv_camera_del(void)
 {
-    uint8_t number = 5;
-
-    /* 为了停止usb_camera task */
-    while(number --)
-    {
-        usb_camera.usb_state = 0x00;
-        usb_camera.usb_start = 0x00;
-        vTaskDelay(5);
-    }
+    usb_camera.usb_start = 0x00;
 
     /* 删除摄像头父类 */
-    lv_obj_del(usb_camera.usb_camera_box);
+    if (usb_camera.usb_camera_box != NULL && lv_obj_is_valid(usb_camera.usb_camera_box))
+    {
+        lv_obj_del(usb_camera.usb_camera_box);
+    }
+    usb_camera.usb_camera_box = NULL;
+    usb_camera.camera_buf.camera_header = NULL;
+    usb_camera.camera_buf.usb_pho_btn = NULL;
     /* 显示主界面 */
     lv_display_box();
 }

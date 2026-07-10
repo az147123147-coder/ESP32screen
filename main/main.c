@@ -33,7 +33,7 @@ void app_main(void)
     ret = nvs_flash_init();             /* 初始化NVS */
 
     lcd_cfg_t lcd_config_info = {0};
-    lcd_config_info.notify_flush_ready = NULL;
+    lcd_config_info.notify_flush_ready = lvgl_notify_flush_ready;
     lcd_config_info.user_ctx = &disp_drv;
 
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)

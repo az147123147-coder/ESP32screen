@@ -12,6 +12,32 @@
 
  #include "bmp.h"
 
+ static uint16_t bmp_read_u16(const uint8_t *data)
+ {
+     return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+ }
+
+ static uint32_t bmp_read_u32(const uint8_t *data)
+ {
+     return (uint32_t)data[0] |
+            ((uint32_t)data[1] << 8) |
+            ((uint32_t)data[2] << 16) |
+            ((uint32_t)data[3] << 24);
+ }
+
+ static FRESULT bmp_read_exact(FIL *fp, void *buffer, UINT size)
+ {
+     UINT bytes_read = 0;
+     FRESULT result = sd_f_read(fp, buffer, size, &bytes_read);
+     return result == FR_OK && bytes_read == size ? FR_OK : FR_INT_ERR;
+ }
+
+ static FRESULT bmp_seek(FIL *fp, FSIZE_t offset)
+ {
+     FRESULT result = sd_f_lseek(fp, offset);
+     return result;
+ }
+
 
  /**
   * @brief       BMP图片解码
@@ -21,204 +47,130 @@
   */
  TickType_t bmp_decode(const char *filename, int width, int height,lcd_write_cb lcd_cb)
  {
-     TickType_t startTick, endTick, diffTick;
-     startTick = xTaskGetTickCount();
- 
-     /* 打开文件 */
-     esp_err_t ret;
-     FIL* fp;
-     uint16_t br = 0;
-     fp = (FIL *)malloc(sizeof(FIL));    /* 申请内存 */
+     TickType_t start_tick = xTaskGetTickCount();
+     FIL *fp = NULL;
+     uint8_t *colors = NULL;
+     uint8_t *row_buffer = NULL;
+     uint8_t header[54];
+     bool file_open = false;
+
+     if (filename == NULL || lcd_cb == NULL || width <= 0 || height <= 0)
+     {
+         return 0;
+     }
+
+     fp = (FIL *)malloc(sizeof(FIL));
      if (fp == NULL)
      {
          ESP_LOGW(__FUNCTION__, "No memory for file [%s]", filename);
          return 0;
      }
- 
-	 /* 选中SD卡 */
-	 SD_CS(0);
-     ret = f_open(fp, (const TCHAR *)filename, FA_READ); /* 打开文件 */
-	/* 取消选中SD卡 */
-	SD_CS(1);
-     if (ret != FR_OK)
+
+     FRESULT result = sd_f_open(fp, (const TCHAR *)filename, FA_READ);
+     if (result != FR_OK)
      {
          ESP_LOGW(__FUNCTION__, "File not found [%s]", filename);
-         free(fp);
-         return 0;
+         goto fail;
      }
- 
-     /* 读取BMP首部 */
-     bmpfile_t *result = (bmpfile_t*)malloc(sizeof(bmpfile_t));
-     if (result == NULL)
-     {
-         f_close(fp);
-         free(fp);
-         return 0;
-     }
-	 /* 选中SD卡 */
-	 SD_CS(0);
-     ret |= f_read(fp,result->header.magic, 2, (UINT *)&br);
-	/* 取消选中SD卡 */
-	SD_CS(1);
-     /* 判断图像是否是BMP文件 */
-     if (result->header.magic[0]!='B' || result->header.magic[1] != 'M')
+     file_open = true;
+
+     if (bmp_read_exact(fp, header, sizeof(header)) != FR_OK || header[0] != 'B' || header[1] != 'M')
      {
          ESP_LOGW(__FUNCTION__, "File is not BMP");
-         free(result);
-         f_close(fp);
-         free(fp);
-         return 0;
+         goto fail;
      }
- 
-	 /* 选中SD卡 */
-	 SD_CS(0);
-     /* 读取BMP首部相关信息，如图片大小，偏移及深度等 */
-     ret |= f_read(fp,&result->header.filesz, 4, (UINT *)&br);
-     ret |= f_read(fp,&result->header.creator1, 2, (UINT *)&br);
-     ret |= f_read(fp,&result->header.creator2, 2, (UINT *)&br);
-     ret |= f_read(fp,&result->header.offset, 4, (UINT *)&br);
-     ret |= f_read(fp,&result->dib.header_sz, 4, (UINT *)&br);
-     ret |= f_read(fp,&result->dib.width, 4, (UINT *)&br);
-     ret |= f_read(fp,&result->dib.height, 4, (UINT *)&br);
-     ret |= f_read(fp,&result->dib.nplanes, 2, (UINT *)&br);
-     ret |= f_read(fp,&result->dib.depth, 2, (UINT *)&br);
-     ret |= f_read(fp,&result->dib.compress_type, 4, (UINT *)&br);
-     ret |= f_read(fp,&result->dib.bmp_bytesz, 4, (UINT *)&br);
-     ret |= f_read(fp,&result->dib.hres, 4, (UINT *)&br);
-     ret |= f_read(fp,&result->dib.vres, 4, (UINT *)&br);
-     ret |= f_read(fp,&result->dib.ncolors, 4, (UINT *)&br);
-     ret |= f_read(fp,&result->dib.nimpcolors, 4, (UINT *)&br);
- 
-	 /* 取消选中SD卡 */
-	 SD_CS(1);
-     /* 判断BMP图像深度 */
-     if ((result->dib.depth == 1) && (result->dib.compress_type == 0))
+
+     uint32_t declared_size = bmp_read_u32(header + 2);
+     uint32_t pixel_offset = bmp_read_u32(header + 10);
+     uint32_t dib_size = bmp_read_u32(header + 14);
+     int32_t source_width_signed = (int32_t)bmp_read_u32(header + 18);
+     int32_t source_height_signed = (int32_t)bmp_read_u32(header + 22);
+     uint16_t planes = bmp_read_u16(header + 26);
+     uint16_t depth = bmp_read_u16(header + 28);
+     uint32_t compression = bmp_read_u32(header + 30);
+     FSIZE_t file_size = f_size(fp);
+
+     if (declared_size < sizeof(header) || declared_size > file_size || dib_size < 40 ||
+         source_width_signed <= 0 || source_height_signed == 0 || source_height_signed == INT32_MIN ||
+         planes != 1 || depth != 24 || compression != 0 ||
+         (uint64_t)pixel_offset < 14ull + dib_size || pixel_offset > file_size)
      {
-         /* 还未实现 */
+         goto fail;
      }
-     else if((result->dib.depth == 24) && (result->dib.compress_type == 0))
+
+     uint32_t source_width = (uint32_t)source_width_signed;
+     uint32_t source_height = source_height_signed < 0 ? (uint32_t)(-(int64_t)source_height_signed) : (uint32_t)source_height_signed;
+     uint64_t row_size = ((uint64_t)source_width * 3u + 3u) & ~3ull;
+     uint64_t pixel_end = (uint64_t)pixel_offset + row_size * source_height;
+
+     if (row_size > UINT32_MAX || pixel_end > file_size || pixel_end > declared_size)
      {
-         /* BMP行填充（如果需要）到4字节边界 */
-         uint32_t rowSize = (result->dib.width * 3 + 3) & ~3;
-         int w = result->dib.width;
-         int h = result->dib.height;
-         int _x;
-         int _w;
-         int _cols;
-         int _cole;
-         int _y;
-         int _rows;
-         int _rowe;
-         int out_w;
-         int out_h;
- 
-         if (width >= w)
+         goto fail;
+     }
+
+     uint32_t output_width = source_width < (uint32_t)width ? source_width : (uint32_t)width;
+     uint32_t output_height = source_height < (uint32_t)height ? source_height : (uint32_t)height;
+     uint32_t first_column = (source_width - output_width) / 2;
+     uint32_t first_row = (source_height - output_height) / 2;
+
+     if (output_width == 0 || output_height == 0 ||
+         output_width > SIZE_MAX / output_height ||
+         (size_t)output_width * output_height > SIZE_MAX / 2 ||
+         output_width > SIZE_MAX / 3 || (size_t)output_width * 3 > UINT32_MAX)
+     {
+         goto fail;
+     }
+
+     size_t output_size = (size_t)output_width * output_height * 2;
+     size_t row_bytes = (size_t)output_width * 3;
+     colors = (uint8_t *)malloc(output_size);
+     row_buffer = (uint8_t *)malloc(row_bytes);
+     if (colors == NULL || row_buffer == NULL)
+     {
+         goto fail;
+     }
+
+     for (uint32_t output_row = 0; output_row < output_height; output_row++)
+     {
+         uint32_t image_row = first_row + output_row;
+         uint32_t file_row = source_height_signed < 0 ? image_row : source_height - 1 - image_row;
+         uint64_t row_offset = (uint64_t)pixel_offset + (uint64_t)file_row * row_size + (uint64_t)first_column * 3u;
+
+         if (row_offset > file_size || row_bytes > file_size - row_offset ||
+             bmp_seek(fp, (FSIZE_t)row_offset) != FR_OK ||
+             bmp_read_exact(fp, row_buffer, (UINT)row_bytes) != FR_OK)
          {
-             _x = (width - w) / 2;
-             _w = w;
-             _cols = 0;
-             _cole = w - 1;
-         }
-         else
-         {
-             _x = 0;
-             _w = width;
-             _cols = (w - width) / 2;
-             _cole = _cols + width - 1;
-         }
- 
-         if (height >= h)
-         {
-             _y = (height - h) / 2;
-             _rows = 0;
-             _rowe = h -1;
-         }
-         else
-         {
-             _y = 0;
-             _rows = (h - height) / 2;
-             _rowe = _rows + height - 1;
+             goto fail;
          }
 
-         out_w = _cole - _cols + 1;
-         out_h = _rowe - _rows + 1;
-
-         if (out_w <= 0 || out_h <= 0)
+         for (uint32_t output_column = 0; output_column < output_width; output_column++)
          {
-             free(result);
-             f_close(fp);
-             free(fp);
-             return 0;
+             size_t source_index = (size_t)output_column * 3;
+             size_t output_index = ((size_t)output_row * output_width + output_column) * 2;
+             uint16_t color = rgb565(row_buffer[source_index + 2], row_buffer[source_index + 1], row_buffer[source_index]);
+             colors[output_index] = (uint8_t)(color & 0xFF);
+             colors[output_index + 1] = (uint8_t)(color >> 8);
          }
- 
-         uint8_t sdbuffer[3 * 20]; /* 像素缓冲区（每个像素R+G+B）*/
-         uint8_t *colors = (uint8_t*)malloc(out_h * out_w * 2);;
-         if (colors == NULL)
-         {
-             free(result);
-             f_close(fp);
-             free(fp);
-             return 0;
-         }
- 
-         for (int row = 0; row < h; row++)
-         {
-             
-             if (row < _rows || row > _rowe)
-             {
-                 continue;
-             }
- 
-             /* 寻找扫描线的起点 */
-             int pos = result->header.offset + (h - 1 - row) * rowSize;
-			 /* 选中SD卡 */
-	         SD_CS(0);
-             f_lseek(fp, pos);
-             /* 取消选中SD卡 */
-	         SD_CS(1);
-			 int buffidx = sizeof(sdbuffer); /* 强制重新加载缓冲区 */
- 
-             for (int col = 0; col < w; col++)
-             {
-                 if (buffidx >= sizeof(sdbuffer))
-                 {
-					 /* 选中SD卡 */
-	                 SD_CS(0);
-                     f_read(fp,sdbuffer, sizeof(sdbuffer), (UINT *)&br);
-					 /* 取消选中SD卡 */
-	                 SD_CS(1);
-                     buffidx = 0;
-                 }
- 
-                 if (col < _cols || col > _cole)
-                 {
-                     buffidx += 3;
-                     continue;
-                 }
- 
-                 /* 将像素从BMP转换为TFT格式 */
-                 uint8_t b = sdbuffer[buffidx++];
-                 uint8_t g = sdbuffer[buffidx++];
-                 uint8_t r = sdbuffer[buffidx++];
-                 int out_x = col - _cols;
-                 int out_y = row - _rows;
-                 uint16_t color = rgb565(r, g, b);
-                 colors[2 * out_x + out_y * out_w * 2] = (uint8_t)(color & 0xFF);
-                 colors[2 * out_x + 1 + out_y * out_w * 2] =  (uint8_t)(color >> 8 &0xFF);
-             }
-             _y++;
-         }
- 
-         lcd_cb(out_w,out_h,colors);
      }
- 
-	 
-     free(result);
-     f_close(fp);
+
+     free(row_buffer);
+     row_buffer = NULL;
+     sd_f_close(fp);
+     file_open = false;
      free(fp);
- 
-     endTick = xTaskGetTickCount();
-     diffTick = endTick - startTick;
-     return diffTick;
+     fp = NULL;
+
+     lcd_cb(output_width, output_height, colors);
+     return xTaskGetTickCount() - start_tick;
+
+fail:
+     free(row_buffer);
+     free(colors);
+     if (file_open)
+     {
+         sd_f_close(fp);
+     }
+     free(fp);
+     return 0;
  }
  

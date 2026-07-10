@@ -40,12 +40,13 @@
  #define rgb565(r, g, b) (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3))
  
  typedef void (*lcd_write_cb)(uint32_t w,uint32_t h,uint8_t *video_buf);
+ typedef uint8_t (*mjpeg_write_cb)(uint32_t w,uint32_t h,uint8_t *video_buf);
  
  /* function declaration */
  char mjpegdec_init(uint16_t offx, uint16_t offy);
  void mjpegdec_free(void);
- uint8_t mjpegdec_decode(uint8_t* buf, uint32_t bsize,lcd_write_cb lcd_cb);
+ uint8_t mjpegdec_decode(uint8_t* buf, uint32_t bsize,mjpeg_write_cb lcd_cb);
  void mjpegdec_malloc(void);
  void mjpegdec_video_free(void);
+ void mjpegdec_advance_buffer(void);
  #endif
- 

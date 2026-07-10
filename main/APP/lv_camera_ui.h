@@ -28,8 +28,8 @@
 typedef struct 
 {
     lv_obj_t *usb_camera_box;
-    uint8_t usb_state;
-    uint8_t usb_start;
+    volatile uint8_t usb_state;
+    volatile uint8_t usb_start;
     struct 
     {
         lv_obj_t *usb_test;

@@ -15,6 +15,19 @@
 
 const char *xl9555_tag = "xl9555";
 i2c_master_dev_handle_t xl9555_handle = NULL;
+static SemaphoreHandle_t xl9555_mutex = NULL;
+static uint16_t xl9555_output_shadow = 0;
+static bool xl9555_output_shadow_valid = false;
+
+static bool xl9555_lock(void)
+{
+    return xl9555_mutex != NULL && xSemaphoreTakeRecursive(xl9555_mutex, portMAX_DELAY) == pdTRUE;
+}
+
+static void xl9555_unlock(void)
+{
+    xSemaphoreGiveRecursive(xl9555_mutex);
+}
 
 /**
  * @brief       读取XL9555的IO值
@@ -24,9 +37,22 @@ i2c_master_dev_handle_t xl9555_handle = NULL;
  */
 esp_err_t xl9555_read_byte(uint8_t *data, size_t len)
 {
+    if (data == NULL || len == 0 || xl9555_handle == NULL || !xl9555_lock())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     uint8_t reg_addr = XL9555_OUTPUT_PORT0_REG;
-    
-    return i2c_master_transmit_receive(xl9555_handle, &reg_addr, 1, data, len, -1);
+    esp_err_t ret = i2c_master_transmit_receive(xl9555_handle, &reg_addr, 1, data, len, -1);
+
+    if (ret == ESP_OK && len >= 2)
+    {
+        xl9555_output_shadow = ((uint16_t)data[1] << 8) | data[0];
+        xl9555_output_shadow_valid = true;
+    }
+
+    xl9555_unlock();
+    return ret;
 }
 
 /**
@@ -38,22 +64,33 @@ esp_err_t xl9555_read_byte(uint8_t *data, size_t len)
  */
 esp_err_t xl9555_write_byte(uint8_t reg, uint8_t *data, size_t len)
 {
-    esp_err_t ret;
+    if (data == NULL || len == 0 || xl9555_handle == NULL || !xl9555_lock())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     uint8_t *buf = malloc(1 + len);
     if (buf == NULL)
     {
         ESP_LOGE(xl9555_tag, "%s memory failed", __func__);
+        xl9555_unlock();
         return ESP_ERR_NO_MEM;      /* 分配内存失败 */
     }
 
     buf[0] = reg;                   /* 0号元素为寄存器数值 */
     memcpy(buf + 1, data, len);     /* 拷贝数据至存储区中 */
 
-    ret = i2c_master_transmit(xl9555_handle, buf, len + 1, -1);
+    esp_err_t ret = i2c_master_transmit(xl9555_handle, buf, len + 1, -1);
 
     free(buf);                      /* 发送完成释放内存 */
 
+    if (ret == ESP_OK && reg == XL9555_OUTPUT_PORT0_REG && len >= 2)
+    {
+        xl9555_output_shadow = ((uint16_t)data[1] << 8) | data[0];
+        xl9555_output_shadow_valid = true;
+    }
+
+    xl9555_unlock();
     return ret;
 }
 
@@ -65,39 +102,39 @@ esp_err_t xl9555_write_byte(uint8_t reg, uint8_t *data, size_t len)
  */
 uint16_t xl9555_pin_write(uint16_t pin, int val)
 {
-    uint8_t w_data[2];
-    uint16_t temp = 0x0000;
-
-    xl9555_read_byte(w_data, 2);
-
-    if (pin <= 0x0080)
+    if (!xl9555_lock())
     {
-        if (val)
+        return xl9555_output_shadow;
+    }
+
+    if (!xl9555_output_shadow_valid)
+    {
+        uint8_t current[2];
+        if (xl9555_read_byte(current, sizeof(current)) != ESP_OK)
         {
-            w_data[0] |= (uint8_t)(0xFF & pin);
+            xl9555_unlock();
+            return xl9555_output_shadow;
         }
-        else
-        {
-            w_data[0] &= ~(uint8_t)(0xFF & pin);
-        }
+    }
+
+    uint16_t next = xl9555_output_shadow;
+    if (val)
+    {
+        next |= pin;
     }
     else
     {
-        if (val)
-        {
-            w_data[1] |= (uint8_t)(0xFF & (pin >> 8));
-        }
-        else
-        {
-            w_data[1] &= ~(uint8_t)(0xFF & (pin >> 8));
-        }
+        next &= (uint16_t)~pin;
     }
 
-    temp = ((uint16_t)w_data[1] << 8) | w_data[0]; 
+    uint8_t output[2] = {(uint8_t)next, (uint8_t)(next >> 8)};
+    if (xl9555_write_byte(XL9555_OUTPUT_PORT0_REG, output, sizeof(output)) != ESP_OK)
+    {
+        next = xl9555_output_shadow;
+    }
 
-    xl9555_write_byte(XL9555_OUTPUT_PORT0_REG, w_data, 2);
-    
-    return temp;
+    xl9555_unlock();
+    return next;
 }
 
 /**
@@ -107,14 +144,17 @@ uint16_t xl9555_pin_write(uint16_t pin, int val)
  */
 int xl9555_pin_read(uint16_t pin)
 {
-    uint16_t ret;
-    uint8_t r_data[2];
+    if (!xl9555_lock())
+    {
+        return -1;
+    }
 
-    xl9555_read_byte(r_data, 2);
+    uint8_t input[2];
+    esp_err_t ret = xl9555_read_byte(input, sizeof(input));
+    int value = ret == ESP_OK ? ((xl9555_output_shadow & pin) ? 1 : 0) : -1;
 
-    ret = r_data[1] << 8 | r_data[0];
-
-    return (ret & pin) ? 1 : 0;
+    xl9555_unlock();
+    return value;
 }
 
 /**
@@ -154,6 +194,15 @@ esp_err_t xl9555_init(void)
 {
     uint8_t r_data[2];
 
+    if (xl9555_mutex == NULL)
+    {
+        xl9555_mutex = xSemaphoreCreateRecursiveMutex();
+        if (xl9555_mutex == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     /* 未调用myiic_init初始化IIC */
     if (bus_handle == NULL)
     {
@@ -169,7 +218,11 @@ esp_err_t xl9555_init(void)
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &xl9555_i2c_dev_conf, &xl9555_handle));
 
     /* 上电先读取一次清除中断标志 */
-    xl9555_read_byte(r_data, 2);
+    esp_err_t ret = xl9555_read_byte(r_data, 2);
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
     /* 配置那些扩展管脚为输入输出模式 */
     xl9555_ioconfig(0xF003);
 
@@ -183,20 +236,26 @@ esp_err_t xl9555_init(void)
  */
 esp_err_t xl9555_pin_toggle(uint16_t pin)
 {
-    uint8_t output_reg[2];
-    esp_err_t ret;
-    
-    /* 读取当前输出状态 */
-    ret = xl9555_read_byte(output_reg, 2);
-    if (ret != ESP_OK) return ret;
+    if (!xl9555_lock())
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
 
-    /* 合并为16位并执行异或操作 */
-    uint16_t current_state = (output_reg[1] << 8) | output_reg[0];
-    current_state ^= pin;
-    
-    /* 分解并写回新状态 */
-    output_reg[0] = current_state & 0xFF;
-    output_reg[1] = (current_state >> 8) & 0xFF;
-    
-    return xl9555_write_byte(XL9555_OUTPUT_PORT0_REG, output_reg, 2);
+    if (!xl9555_output_shadow_valid)
+    {
+        uint8_t current[2];
+        esp_err_t ret = xl9555_read_byte(current, sizeof(current));
+        if (ret != ESP_OK)
+        {
+            xl9555_unlock();
+            return ret;
+        }
+    }
+
+    uint16_t next = xl9555_output_shadow ^ pin;
+    uint8_t output[2] = {(uint8_t)next, (uint8_t)(next >> 8)};
+    esp_err_t ret = xl9555_write_byte(XL9555_OUTPUT_PORT0_REG, output, sizeof(output));
+
+    xl9555_unlock();
+    return ret;
 }

@@ -18,8 +18,19 @@
 
 static const char *TAG = "LCD";
 esp_lcd_panel_handle_t panel_handle = NULL; /* LCD句柄 */
+static esp_lcd_panel_io_handle_t lcd_io_handle = NULL;
 uint32_t g_back_color  = 0xFFFF;
 lcd_obj_t lcd_dev;
+
+static esp_err_t lcd_wait_color_trans_done(void)
+{
+    if (lcd_io_handle == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return esp_lcd_panel_io_tx_param(lcd_io_handle, 0x00, NULL, 0);
+}
 
 /**
  * @brief       以一种颜色清空LCD屏
@@ -53,7 +64,8 @@ void lcd_clear(uint16_t color)
 	   
 	   y += current_height; 
    }
-   
+
+   ESP_ERROR_CHECK(lcd_wait_color_trans_done());
    heap_caps_free(buffer);
    vTaskDelay(1);
 }
@@ -152,6 +164,7 @@ void lcd_color_fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t
         }
 
         esp_lcd_panel_draw_bitmap(panel_handle, sx, sy + y_index, ex + 1, sy + y_index + 1, buffer);
+        ESP_ERROR_CHECK(lcd_wait_color_trans_done());
     }
 
     lcd_draw_point(ex, ey, color[total_pixels - 1]);
@@ -311,6 +324,7 @@ void lcd_draw_hline(uint16_t x, uint16_t y, uint16_t len, uint16_t color)
     }
 
     esp_lcd_panel_draw_bitmap(panel_handle, x, y, ex + 1, ey + 1, color_buffer);
+    ESP_ERROR_CHECK(lcd_wait_color_trans_done());
     free(color_buffer);
 }
 
@@ -617,6 +631,7 @@ void lcd_display_dir(uint8_t dir)
 void lcd_draw_point(uint16_t x, uint16_t y, uint16_t color)
 {
     esp_lcd_panel_draw_bitmap(panel_handle, x, y, x + 1, y + 1, (uint16_t *)&color);
+    ESP_ERROR_CHECK(lcd_wait_color_trans_done());
 }
 
 /**
@@ -694,6 +709,7 @@ void lcd_init(lcd_cfg_t lcd_config)
         .lcd_param_bits = 8,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_i80(i80_bus, &io_config, &io_handle));
+    lcd_io_handle = io_handle;
     
 	/* LCD复位 */
 	LCD_RST(1);

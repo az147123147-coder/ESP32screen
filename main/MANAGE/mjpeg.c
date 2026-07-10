@@ -21,6 +21,8 @@
  #include "mjpeg.h"
  #include "esp_heap_caps.h"
  #include "esp_jpeg_dec.h"
+ #include <limits.h>
+ #include <stdint.h>
 
 
  uint8_t * video_buf;
@@ -31,6 +33,22 @@
  uint16_t imgoffx, imgoffy;                  /* The offset of the image in the x and y directions */
  typedef struct my_error_mgr* my_error_ptr;
  static jpeg_dec_handle_t *esp_jpeg_dec = NULL;
+ static size_t video_buf_capacity = 0;
+ static uint8_t *video_buf_spare = NULL;
+
+ static uint8_t *mjpegdec_alloc_buffer(size_t buf_size)
+ {
+     uint8_t *buf = heap_caps_aligned_alloc(64, buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+     if (buf == NULL)
+     {
+         buf = heap_caps_aligned_alloc(64, buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+     }
+     if (buf == NULL)
+     {
+         buf = heap_caps_aligned_alloc(64, buf_size, MALLOC_CAP_8BIT);
+     }
+     return buf;
+ }
  
  /**
   * @brief       Error Exiting
@@ -67,16 +85,30 @@
   */
  void mjpegdec_malloc(void)
  {
-     size_t raw_size = (size_t)Windows_Width * Windows_Height * 2;
-     size_t buf_size = (raw_size + 63) & ~((size_t)63);
-     video_buf = heap_caps_aligned_alloc(64, buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-     if (video_buf == NULL)
+     mjpegdec_video_free();
+     video_buf_capacity = 0;
+     if (Windows_Width <= 0 || Windows_Height <= 0 ||
+         (size_t)Windows_Width > SIZE_MAX / (size_t)Windows_Height ||
+         (size_t)Windows_Width * (size_t)Windows_Height > SIZE_MAX / 2)
      {
-         video_buf = heap_caps_aligned_alloc(64, buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+         return;
      }
-     if (video_buf == NULL)
+
+     size_t raw_size = (size_t)Windows_Width * (size_t)Windows_Height * 2;
+     if (raw_size > SIZE_MAX - 63)
      {
-         video_buf = heap_caps_aligned_alloc(64, buf_size, MALLOC_CAP_8BIT);
+         return;
+     }
+     size_t buf_size = (raw_size + 63) & ~((size_t)63);
+     video_buf = mjpegdec_alloc_buffer(buf_size);
+     video_buf_spare = mjpegdec_alloc_buffer(buf_size);
+     if (video_buf == NULL || video_buf_spare == NULL)
+     {
+         mjpegdec_video_free();
+     }
+     else
+     {
+         video_buf_capacity = buf_size;
      }
  }
  
@@ -91,6 +123,22 @@
      {
          heap_caps_free(video_buf);
          video_buf = NULL;
+     }
+     if (video_buf_spare != NULL)
+     {
+         heap_caps_free(video_buf_spare);
+         video_buf_spare = NULL;
+     }
+     video_buf_capacity = 0;
+ }
+
+ void mjpegdec_advance_buffer(void)
+ {
+     if (video_buf != NULL && video_buf_spare != NULL)
+     {
+         uint8_t *displayed_buf = video_buf;
+         video_buf = video_buf_spare;
+         video_buf_spare = displayed_buf;
      }
  }
 
@@ -120,9 +168,13 @@
      }
  }
 
- static uint8_t mjpegdec_decode_esp_jpeg(uint8_t* buf, uint32_t bsize,lcd_write_cb lcd_cb)
+ static uint8_t mjpegdec_decode_esp_jpeg(uint8_t* buf, uint32_t bsize,mjpeg_write_cb lcd_cb)
  {
-     if (bsize == 0 || video_buf == NULL) return 1;
+     if (buf == NULL || lcd_cb == NULL || bsize == 0 || bsize > INT_MAX || video_buf == NULL ||
+         Windows_Width <= 0 || Windows_Height <= 0 ||
+         (size_t)Windows_Width > SIZE_MAX / (size_t)Windows_Height ||
+         (size_t)Windows_Width * (size_t)Windows_Height > SIZE_MAX / 2 ||
+         (size_t)Windows_Width * (size_t)Windows_Height * 2 > video_buf_capacity) return 1;
  
      if (mjpegdec_esp_jpeg_open() != 0) return 2;
  
@@ -154,8 +206,13 @@
          mjpegdec_esp_jpeg_close();
          return 5;
      }
- 
-     lcd_cb(Windows_Width,Windows_Height,video_buf);
+
+     if (lcd_cb(Windows_Width,Windows_Height,video_buf) == 0)
+     {
+         mjpegdec_esp_jpeg_close();
+         return 6;
+     }
+     mjpegdec_advance_buffer();
      return 0;
  }
  
@@ -166,20 +223,23 @@
   * @param       lcd_cb : Drawing function pointers
   * @retval      0:succeed; !0:failed
   */
- uint8_t mjpegdec_decode(uint8_t* buf, uint32_t bsize,lcd_write_cb lcd_cb)
+ uint8_t mjpegdec_decode(uint8_t* buf, uint32_t bsize,mjpeg_write_cb lcd_cb)
  {
      JSAMPARRAY buffer;
-     if (bsize == 0) return 1;
-     if (mjpegdec_decode_esp_jpeg(buf, bsize, lcd_cb) == 0) return 0;
-     int row_stride = 0;
-     int j = 0;
-     int lineR = 0;
+     if (buf == NULL || lcd_cb == NULL || cinfo == NULL || jerr == NULL || bsize == 0 || bsize > INT_MAX ||
+         video_buf == NULL || Windows_Width <= 0 || Windows_Height <= 0 ||
+         (size_t)Windows_Width > SIZE_MAX / (size_t)Windows_Height ||
+         (size_t)Windows_Width * (size_t)Windows_Height > SIZE_MAX / 2 ||
+         (size_t)Windows_Width * (size_t)Windows_Height * 2 > video_buf_capacity) return 1;
+     uint8_t esp_decode_result = mjpegdec_decode_esp_jpeg(buf, bsize, lcd_cb);
+     if (esp_decode_result == 0) return 0;
+     if (esp_decode_result == 6) return 6;
+     size_t row_stride = 0;
+     size_t line_offset = 0;
      
      cinfo->err = jpeg_std_error(&jerr->pub);
      jerr->pub.error_exit = my_error_exit;
      jerr->pub.emit_message = my_emit_message;
-     cinfo->out_color_space = JCS_RGB;
- 
      if (setjmp(jerr->setjmp_buffer))
      {
          jpeg_abort_decompress(cinfo);
@@ -190,9 +250,24 @@
      jpeg_create_decompress(cinfo);
  
      jpeg_mem_src(cinfo, buf, bsize);
-     jpeg_read_header(cinfo, TRUE);
- 
+     if (jpeg_read_header(cinfo, TRUE) != JPEG_HEADER_OK)
+     {
+         jpeg_destroy_decompress(cinfo);
+         return 3;
+     }
+
+     cinfo->out_color_space = JCS_RGB;
+
      jpeg_start_decompress(cinfo);
+
+     if (cinfo->output_width != (JDIMENSION)Windows_Width ||
+         cinfo->output_height != (JDIMENSION)Windows_Height ||
+         cinfo->output_components != 3)
+     {
+         jpeg_abort_decompress(cinfo);
+         jpeg_destroy_decompress(cinfo);
+         return 4;
+     }
 
      row_stride = cinfo->output_width * cinfo->output_components;
  
@@ -201,28 +276,34 @@
      
      while (cinfo->output_scanline < cinfo->output_height)
      {
-         int i = 0;
- 
-         jpeg_read_scanlines(cinfo, buffer, 1);
+         size_t i = 0;
+
+         if (jpeg_read_scanlines(cinfo, buffer, 1) != 1)
+         {
+             jpeg_abort_decompress(cinfo);
+             jpeg_destroy_decompress(cinfo);
+             return 5;
+         }
          unsigned short tmp_color565;
- 
-         for (int k = 0; k < Windows_Width * 2; k += 2)
+
+         for (size_t k = 0; k < (size_t)Windows_Width * 2; k += 2)
          {
              tmp_color565 = rgb565(buffer[0][i],buffer[0][i + 1],buffer[0][i + 2]);
-             video_buf[lineR + k] = tmp_color565 & 0x00FF;
-             video_buf[lineR + k + 1] =  (tmp_color565 & 0xFF00) >> 8;
- 
+             video_buf[line_offset + k] = tmp_color565 & 0x00FF;
+             video_buf[line_offset + k + 1] =  (tmp_color565 & 0xFF00) >> 8;
+
              i += 3;
          }
-         
-         j++;
-         lineR = j * Windows_Width * 2;
+
+         line_offset += (size_t)Windows_Width * 2;
      }
-     lcd_cb(Windows_Width,Windows_Height,video_buf);
-     
+
      jpeg_finish_decompress(cinfo);
      jpeg_destroy_decompress(cinfo);
-     
+
+     if (lcd_cb(Windows_Width,Windows_Height,video_buf) == 0) return 6;
+     mjpegdec_advance_buffer();
+
      return 0;
  }
  

@@ -11,6 +11,7 @@
  */
 
 #include "lv_main_ui.h"
+#include "esp_log.h"
 
 /* 声明WKS LOGO */
 LV_IMG_DECLARE(bg)
@@ -84,24 +85,84 @@ uint8_t lv_smail_icon_get_state(small_icon_state_t state)
     }
 }
 
+void lv_mem_log(void)
+{
+    lv_mem_monitor_t mon;
+    lv_mem_monitor(&mon);
+    ESP_LOGI("LVGL_MEM", "free:%lu biggest:%lu used:%d%% frag:%d%%",
+             (unsigned long)mon.free_size, (unsigned long)mon.free_biggest_size,
+             mon.used_pct, mon.frag_pct);
+}
+
 /**
  * @brief       消息提示删除
  * @param       无
  * @retval      无
  */
-void lv_msgbox_del(void)
+void lv_focus_restore(void)
 {
-    lv_obj_del(app_obj_general.current_parent);
-    app_obj_general.current_parent = NULL;
-
-    if (indev_keypad != NULL)
+    if (indev_keypad == NULL || ctrl_g == NULL)
     {
-        for (int i = 0; i <= 2;i++)
+        return;
+    }
+
+    lv_group_remove_all_objs(ctrl_g);
+    for (int i = 0; i < main_ic0_num; i++)
+    {
+        if (main_ui.mian_inter.ico[i] != NULL && lv_obj_is_valid(main_ui.mian_inter.ico[i]))
         {
             lv_group_add_obj(ctrl_g, main_ui.mian_inter.ico[i]);
         }
+    }
+    if (main_ui.mian_inter.ico[0] != NULL && lv_obj_is_valid(main_ui.mian_inter.ico[0]))
+    {
+        lv_group_focus_obj(main_ui.mian_inter.ico[0]);
+    }
+}
 
-        lv_group_focus_obj(main_ui.mian_inter.ico[0]);  /* 聚焦第一个APP */
+static void lv_close_active_app(void)
+{
+    lv_obj_t *parent = app_obj_general.del_parent;
+    void (*close_fn)(void) = app_obj_general.APP_Function;
+
+    if (parent == NULL || close_fn == NULL)
+    {
+        return;
+    }
+
+    close_fn();
+
+    if (app_obj_general.del_parent == parent && !lv_obj_is_valid(parent))
+    {
+        app_obj_general.del_parent = NULL;
+        app_obj_general.APP_Function = NULL;
+        app_obj_general.app_state = NOT_DEL_STATE;
+        app_obj_general.requires_sd = 0;
+    }
+}
+
+static void lv_msgbox_delete_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    if (obj == app_obj_general.current_parent)
+    {
+        app_obj_general.current_parent = NULL;
+        app_obj_general.Function = NULL;
+    }
+}
+
+void lv_msgbox_del(void)
+{
+    if (app_obj_general.current_parent != NULL && lv_obj_is_valid(app_obj_general.current_parent))
+    {
+        lv_msgbox_close(app_obj_general.current_parent);
+    }
+    app_obj_general.current_parent = NULL;
+    app_obj_general.Function = NULL;
+
+    if (app_obj_general.del_parent == NULL)
+    {
+        lv_focus_restore();
     }
 }
 
@@ -112,7 +173,10 @@ void lv_msgbox_del(void)
  */
 void lv_hidden_box(void)
 {
-    lv_obj_add_flag(main_ui.mian_inter.mian_imagebg_obx,LV_OBJ_FLAG_HIDDEN);
+    if (main_ui.mian_box != NULL && lv_obj_is_valid(main_ui.mian_box))
+    {
+        lv_obj_add_flag(main_ui.mian_box, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 /**
@@ -122,16 +186,11 @@ void lv_hidden_box(void)
  */
 void lv_display_box(void)
 {
-    lv_obj_clear_flag(main_ui.mian_inter.mian_imagebg_obx,LV_OBJ_FLAG_HIDDEN);
-    if (indev_keypad != NULL)
+    if (main_ui.mian_box != NULL && lv_obj_is_valid(main_ui.mian_box))
     {
-        for (int i = 0; i <= 2;i++)
-        {
-            lv_group_add_obj(ctrl_g, main_ui.mian_inter.ico[i]);
-        }
-
-        lv_group_focus_obj(main_ui.mian_inter.ico[0]);  /* 聚焦第一个APP */
+        lv_obj_clear_flag(main_ui.mian_box, LV_OBJ_FLAG_HIDDEN);
     }
+    lv_focus_restore();
 }
 
 /**
@@ -141,9 +200,18 @@ void lv_display_box(void)
  */
 void lv_msgbox(char *name)
 {
-    /* msgbox 创建 */
-    lv_obj_t *msgbox = lv_msgbox_create(lv_scr_act(),LV_SYMBOL_WARNING "Notice",name, NULL,false);
-    lv_obj_set_size(msgbox, lv_obj_get_width(lv_scr_act()) - 20, lv_obj_get_height(lv_scr_act()) / 3);   /* set size */
+    if (app_obj_general.current_parent != NULL)
+    {
+        if (lv_obj_is_valid(app_obj_general.current_parent))
+        {
+            lv_msgbox_close(app_obj_general.current_parent);
+        }
+        app_obj_general.current_parent = NULL;
+        app_obj_general.Function = NULL;
+    }
+
+    lv_obj_t *msgbox = lv_msgbox_create(NULL,LV_SYMBOL_WARNING "Notice",name, NULL,true);
+    lv_obj_set_size(msgbox, lv_obj_get_width(lv_scr_act()) - 20, lv_obj_get_height(lv_scr_act()) / 3);
     lv_obj_center(msgbox);
     lv_obj_set_style_border_width(msgbox, 0, 0);
     lv_obj_set_style_shadow_width(msgbox, 20, 0);
@@ -161,6 +229,7 @@ void lv_msgbox(char *name)
     lv_obj_set_style_pad_top(content,15,LV_STATE_DEFAULT);
     app_obj_general.current_parent = msgbox;
     app_obj_general.Function = lv_msgbox_del;
+    lv_obj_add_event_cb(msgbox, lv_msgbox_delete_cb, LV_EVENT_DELETE, NULL);
     lv_obj_move_foreground(back_btn);
 }
 
@@ -268,14 +337,16 @@ static void lv_backbtn_control_event_handler(lv_event_t *event)
     {
         if (app_obj_general.current_parent != NULL)
         {
-            app_obj_general.Function();
+            if (app_obj_general.Function != NULL)
+            {
+                app_obj_general.Function();
+            }
+            return;
         }
 
-        /* 返回主界面 */
-        if (app_obj_general.del_parent != NULL)
+        if (app_obj_general.del_parent != NULL && app_obj_general.APP_Function != NULL)
         {
-            app_obj_general.APP_Function();
-            app_obj_general.del_parent = NULL;
+            lv_close_active_app();
         }
     }
 }
@@ -302,7 +373,8 @@ static void lv_imgbtn_control_event_handler(lv_event_t *event)
 
         lv_trigger_bit = ((unsigned int)lv_clz((app_readly_list)));
         app_readly_list[lv_trigger_bit] = 0;
-        //printf("%d\n",lv_trigger_bit);
+        lv_mem_log();
+        app_obj_general.requires_sd = 0;
 
         if (indev_keypad != NULL)
         {
@@ -352,6 +424,13 @@ static void lv_imgbtn_control_event_handler(lv_event_t *event)
             default:
                 break;
         }
+
+        lv_mem_log();
+
+        if (app_obj_general.del_parent == NULL && app_obj_general.current_parent == NULL)
+        {
+            lv_display_box();
+        }
     }
 }
 
@@ -375,9 +454,7 @@ static void lv_rtc_timer(lv_timer_t* timer)
     lv_label_set_text_fmt(main_ui.mian_inter.mian_time_text,"%02d : %02d", main_ui.rtc.hour, main_ui.rtc.minute);
     if (app_obj_general.del_parent != NULL && app_obj_general.app_state == DEL_STATE && app_obj_general.APP_Function != NULL)
     {
-        app_obj_general.APP_Function();
-        app_obj_general.del_parent = NULL;
-        app_obj_general.app_state = NOT_DEL_STATE;
+        lv_close_active_app();
     }
 
     // if (lv_smail_icon_get_state(TF_STATE))
@@ -551,7 +628,7 @@ void lv_mian_ui(void)
 			
 			lv_obj_set_size(main_ui.mian_inter.ico[ico_num], icon_size, icon_size);
 			lv_obj_set_pos(main_ui.mian_inter.ico[ico_num], x, y);
-			lv_obj_set_style_bg_opa(main_ui.mian_inter.ico[ico_num], LV_OPA_50, LV_STATE_FOCUSED);
+			lv_obj_set_style_bg_opa(main_ui.mian_inter.ico[ico_num], LV_OPA_TRANSP, LV_STATE_FOCUSED);
 			lv_obj_add_event_cb(main_ui.mian_inter.ico[ico_num], lv_imgbtn_control_event_handler, LV_EVENT_ALL, NULL);
 			
 			/* 创建应用名称标签 */
@@ -576,11 +653,6 @@ void lv_mian_ui(void)
 
     if (indev_keypad != NULL)
     {
-        for (int i = 0; i <= 8;i++)
-        {
-            lv_group_add_obj(ctrl_g, main_ui.mian_inter.ico[i]);
-        }
-
         lv_group_focus_obj(main_ui.mian_inter.ico[0]);  /* 聚焦第一个APP */
     }
 
