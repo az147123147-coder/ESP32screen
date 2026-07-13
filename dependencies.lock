@@ -10,7 +10,7 @@ dependencies:
       type: service
     version: 0.5.3
   espressif/esp_tinyusb:
-    component_hash: 43d73c626724054db083ad2a537e8af223e3bca7a915fc38a9d9c6c7f2920a69
+    component_hash: 6a50305bc61c7a361da8c0833642be824e92dacb0a6001719a832a4e96e471bf
     dependencies:
     - name: idf
       require: private
@@ -22,9 +22,9 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.4.3
+    version: 1.7.6~2
   espressif/tinyusb:
-    component_hash: 10703da2c3cd39a944711ee3d320c6dda54debabf13b4b933a7c90daf102372b
+    component_hash: a40b7f67df6ac254a4afd96c6401cc56f2059ae747d6d7e66b568bca53ad0edc
     dependencies:
     - name: idf
       require: private
@@ -36,28 +36,13 @@ dependencies:
     - esp32s2
     - esp32s3
     - esp32p4
-    version: 0.18.0~2
-  espressif/usb_stream:
-    component_hash: 28afd6278e70943ed5051be4cbadb963f0d026148298d83370afaef58167e157
-    dependencies:
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: 0.5.*
-    - name: idf
-      require: private
-      version: '>=4.4.1'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    targets:
-    - esp32s2
-    - esp32s3
-    version: 1.4.0
+    - esp32h4
+    - esp32s31
+    version: 0.19.0~3
   idf:
     source:
       type: idf
-    version: 5.4.1
+    version: 6.0.1
   lijunru-hub/esp-ppbuffer:
     component_hash: d27fa07485f06b8589a0218502f174cedbffc18ef082d4a1f811c8ad0eb22f41
     dependencies:
@@ -74,9 +59,8 @@ dependencies:
     version: 0.1.0
 direct_dependencies:
 - espressif/esp_tinyusb
-- espressif/usb_stream
 - idf
 - lijunru-hub/esp-ppbuffer
-manifest_hash: 8d26cf912da9657375253c270a35becbe93e185782f0c761bf0c13eb755f6994
+manifest_hash: bcf8edce5f06a52d16bccac9698af49b518cd5bf0e33fab92a81a851a9384947
 target: esp32s3
-version: 2.0.0
+version: 3.0.0

@@ -117,4 +117,8 @@ void lv_smail_icon_clear_state(small_icon_state_t state);
 uint8_t lv_smail_icon_get_state(small_icon_state_t state);
 void lv_focus_restore(void);
 void lv_mem_log(void);
+void lv_request_active_app_close_from_task(void (*expected_close_fn)(void));
+uint32_t lv_request_sd_app_close_from_task(void);
+bool lv_app_close_request_complete(uint32_t request_id);
+void lv_process_app_close_requests(void);
 #endif

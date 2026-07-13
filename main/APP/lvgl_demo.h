@@ -21,20 +21,18 @@
 #include "freertos/semphr.h"
 #include "sdmmc_cmd.h"
 #include "spi_sd.h"
-#include "lv_camera_ui.h"
 #include "touch.h"
-#include "esp_dma_utils.h"
 #include "lv_start_ui.h"
 #include "lv_main_ui.h"
 #include "key.h"
-#include "usart.h"
 
 
 extern lv_disp_drv_t disp_drv;      /* 回调函数的参数 */
 extern lv_indev_data_t touch_data;
 
 /* 函数声明 */
-void lvgl_demo(void);
+esp_err_t lvgl_demo(void);
+void lvgl_set_display_dir(uint8_t dir, bool flipped);
 void lvgl_mux_unlock(void);
 bool lvgl_mux_lock(int timeout_ms);
 void touchpad_get_xy(lv_coord_t *x, lv_coord_t *y);

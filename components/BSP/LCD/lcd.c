@@ -17,6 +17,7 @@
 
 
 static const char *TAG = "LCD";
+#define LCD_CLEAR_BLOCK_LINES 16
 esp_lcd_panel_handle_t panel_handle = NULL; /* LCD句柄 */
 static esp_lcd_panel_io_handle_t lcd_io_handle = NULL;
 uint32_t g_back_color  = 0xFFFF;
@@ -37,37 +38,56 @@ static esp_err_t lcd_wait_color_trans_done(void)
  * @param       color 清屏颜色
  * @retval      无
  */
-void lcd_clear(uint16_t color)
+esp_err_t lcd_clear(uint16_t color)
 {
-   uint16_t y = 0;
-   const uint32_t MAX_BUFFER_SIZE = 65536; 
-   uint16_t block_height = MAX_BUFFER_SIZE / (lcd_dev.width * sizeof(uint16_t));
-   if (block_height == 0) block_height = 1; 
-   
-   uint16_t *buffer = heap_caps_malloc(lcd_dev.width * block_height * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-   if (NULL == buffer)
-   {
-	   ESP_LOGE(TAG, "Memory for bitmap is not enough");
-	   return;
-   }
-   
-   for (uint32_t i = 0; i < lcd_dev.width * block_height; i++)
-   {
-	   buffer[i] = color;
-   }
-   
-   while (y < lcd_dev.height)
-   {
-	   uint16_t current_height = (y + block_height > lcd_dev.height) ? (lcd_dev.height - y) : block_height;
+    if (panel_handle == NULL || lcd_io_handle == NULL || lcd_dev.width == 0 || lcd_dev.height == 0)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
 
-	   esp_lcd_panel_draw_bitmap(panel_handle, 0, y, lcd_dev.width, y + current_height, buffer);
-	   
-	   y += current_height; 
-   }
+    const uint16_t block_height = lcd_dev.height < LCD_CLEAR_BLOCK_LINES ? lcd_dev.height : LCD_CLEAR_BLOCK_LINES;
+    const size_t pixel_count = (size_t)lcd_dev.width * block_height;
+    uint16_t *buffer = heap_caps_malloc(pixel_count * sizeof(*buffer), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (buffer == NULL)
+    {
+        ESP_LOGE(TAG, "Memory for bitmap is not enough");
+        return ESP_ERR_NO_MEM;
+    }
 
-   ESP_ERROR_CHECK(lcd_wait_color_trans_done());
-   heap_caps_free(buffer);
-   vTaskDelay(1);
+    for (size_t i = 0; i < pixel_count; i++)
+    {
+        buffer[i] = color;
+    }
+
+    esp_err_t ret = ESP_OK;
+    uint16_t y = 0;
+    while (y < lcd_dev.height)
+    {
+        uint16_t current_height = (y + block_height > lcd_dev.height) ? (lcd_dev.height - y) : block_height;
+        ret = esp_lcd_panel_draw_bitmap(panel_handle, 0, y, lcd_dev.width, y + current_height, buffer);
+        if (ret != ESP_OK)
+        {
+            break;
+        }
+        y += current_height;
+    }
+
+    esp_err_t sync_ret = lcd_wait_color_trans_done();
+    heap_caps_free(buffer);
+    if (sync_ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "LCD transfer sync failed: %s", esp_err_to_name(sync_ret));
+        return sync_ret;
+    }
+
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "LCD clear failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+    return ESP_OK;
 }
 
 /**
@@ -83,7 +103,8 @@ void lcd_clear(uint16_t color)
 void lcd_fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t color)
 {
     /* 确保坐标在合法范围内 */
-    if (sx >= lcd_dev.width || sy >= lcd_dev.height || ex >= lcd_dev.width || ey >= lcd_dev.height || sx > ex || sy > ey)  
+    if (panel_handle == NULL || lcd_io_handle == NULL || sx >= lcd_dev.width || sy >= lcd_dev.height ||
+        ex >= lcd_dev.width || ey >= lcd_dev.height || sx > ex || sy > ey)
     {
         ESP_LOGE("TAG", "Invalid fill area: sx=%d, sy=%d, ex=%d, ey=%d", sx, sy, ex, ey);
         return;
@@ -94,7 +115,7 @@ void lcd_fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t color
     uint16_t height = ey - sy + 1;  
 
     /* 分配单行缓冲区 */
-    uint16_t *buffer = heap_caps_malloc(width * sizeof(uint16_t), MALLOC_CAP_INTERNAL);
+    uint16_t *buffer = heap_caps_malloc(width * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     if (NULL == buffer)
     {
         ESP_LOGE(TAG, "Memory for bitmap is not enough");
@@ -108,15 +129,28 @@ void lcd_fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t color
     }
 
     /* 逐行绘制填充区域 */
+    esp_err_t ret = ESP_OK;
     for (uint16_t y = 0; y < height; y++)
     {
-        esp_lcd_panel_draw_bitmap(panel_handle, sx, sy + y, ex + 1, sy + y + 1, buffer);
+        ret = esp_lcd_panel_draw_bitmap(panel_handle, sx, sy + y, ex + 1, sy + y + 1, buffer);
+        if (ret != ESP_OK)
+        {
+            break;
+        }
     }
 
-    lcd_draw_point(ex, ey, color);
+    esp_err_t sync_ret = lcd_wait_color_trans_done();
 
     /* 释放内存 */
     heap_caps_free(buffer);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "LCD fill failed: %s", esp_err_to_name(ret));
+    }
+    else if (sync_ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "LCD fill sync failed: %s", esp_err_to_name(sync_ret));
+    }
 }
 
 /**
@@ -132,7 +166,8 @@ void lcd_fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t color
 void lcd_color_fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t *color)
 {
     /* 确保坐标在合法范围内 */
-    if (sx >= lcd_dev.width || sy >= lcd_dev.height || ex >= lcd_dev.width || ey >= lcd_dev.height || sx > ex || sy > ey)
+    if (panel_handle == NULL || lcd_io_handle == NULL || color == NULL || sx >= lcd_dev.width ||
+        sy >= lcd_dev.height || ex >= lcd_dev.width || ey >= lcd_dev.height || sx > ex || sy > ey)
     {
         ESP_LOGE("TAG", "Invalid fill area: sx=%d, sy=%d, ex=%d, ey=%d", sx, sy, ex, ey);
         return;
@@ -144,13 +179,14 @@ void lcd_color_fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t
     uint32_t total_pixels = width * height; 
     uint32_t buf_index = 0;
 
-    uint16_t *buffer = heap_caps_malloc(width * sizeof(uint16_t), MALLOC_CAP_INTERNAL);
+    uint16_t *buffer = heap_caps_malloc(width * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     if (NULL == buffer)
     {
         ESP_LOGE(TAG, "Memory for bitmap is not enough");
         return;
     }
 
+    esp_err_t ret = ESP_OK;
     for (uint16_t y_index = 0; y_index < height; y_index++)
     {
         /* 填充当前行的颜色数据 */
@@ -163,13 +199,23 @@ void lcd_color_fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t
             }
         }
 
-        esp_lcd_panel_draw_bitmap(panel_handle, sx, sy + y_index, ex + 1, sy + y_index + 1, buffer);
-        ESP_ERROR_CHECK(lcd_wait_color_trans_done());
+        ret = esp_lcd_panel_draw_bitmap(panel_handle, sx, sy + y_index, ex + 1, sy + y_index + 1, buffer);
+        if (ret != ESP_OK)
+        {
+            break;
+        }
+        ret = lcd_wait_color_trans_done();
+        if (ret != ESP_OK)
+        {
+            break;
+        }
     }
 
-    lcd_draw_point(ex, ey, color[total_pixels - 1]);
-
     heap_caps_free(buffer);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "LCD color fill failed: %s", esp_err_to_name(ret));
+    }
 }
 
 /**
@@ -630,8 +676,20 @@ void lcd_display_dir(uint8_t dir)
  */
 void lcd_draw_point(uint16_t x, uint16_t y, uint16_t color)
 {
-    esp_lcd_panel_draw_bitmap(panel_handle, x, y, x + 1, y + 1, (uint16_t *)&color);
-    ESP_ERROR_CHECK(lcd_wait_color_trans_done());
+    if (panel_handle == NULL || x >= lcd_dev.width || y >= lcd_dev.height)
+    {
+        return;
+    }
+
+    esp_err_t ret = esp_lcd_panel_draw_bitmap(panel_handle, x, y, x + 1, y + 1, (uint16_t *)&color);
+    if (ret == ESP_OK)
+    {
+        ret = lcd_wait_color_trans_done();
+    }
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "LCD draw point failed: %s", esp_err_to_name(ret));
+    }
 }
 
 /**
@@ -639,10 +697,16 @@ void lcd_draw_point(uint16_t x, uint16_t y, uint16_t color)
  * @param       lcd_config:LCD配置信息
  * @retval      无
  */
-void lcd_init(lcd_cfg_t lcd_config)
+esp_err_t lcd_init(lcd_cfg_t lcd_config)
 {
+    esp_err_t ret;
     gpio_config_t gpio_init_struct = {0};
     esp_lcd_panel_io_handle_t io_handle = NULL;
+    ret = xl9555_pin_write(BL_CTR_IO, 0);
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
     lcd_dev.wr = LCD_NUM_WR;                                        /* 配置WR引脚 */
     lcd_dev.cs = LCD_NUM_CS;                                        /* 配置CS引脚 */
     lcd_dev.dc = LCD_NUM_DC;                                        /* 配置DC引脚 */
@@ -657,8 +721,16 @@ void lcd_init(lcd_cfg_t lcd_config)
     gpio_init_struct.pin_bit_mask = 1ull << lcd_dev.rd;             /* 配置引脚位掩码 */
     gpio_init_struct.pull_down_en = GPIO_PULLDOWN_DISABLE;          /* 失能下拉 */
     gpio_init_struct.pull_up_en = GPIO_PULLUP_ENABLE;               /* 使能下拉 */
-    gpio_config(&gpio_init_struct);                                 /* 引脚配置 */
-    gpio_set_level(lcd_dev.rd, 1);                                  /* RD管脚拉高 */
+    ret = gpio_config(&gpio_init_struct);                           /* 引脚配置 */
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
+    ret = gpio_set_level(lcd_dev.rd, 1);                            /* RD管脚拉高 */
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
 
     esp_lcd_i80_bus_handle_t i80_bus = NULL;
     esp_lcd_i80_bus_config_t bus_config = {                         /* 初始化80并口总线 */
@@ -685,14 +757,17 @@ void lcd_init(lcd_cfg_t lcd_config)
         },
         .bus_width = 16,
         .max_transfer_bytes = lcd_dev.pwidth * lcd_dev.pheight * sizeof(uint16_t),
-        .psram_trans_align = 64,
-        .sram_trans_align = 4,
+        .dma_burst_size = 64,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_i80_bus(&bus_config, &i80_bus));    /* 新建80并口总线 */
+    ret = esp_lcd_new_i80_bus(&bus_config, &i80_bus);               /* 新建80并口总线 */
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
 
     esp_lcd_panel_io_i80_config_t io_config = {                     /* 80并口配置 */
         .cs_gpio_num = lcd_dev.cs,
-        .pclk_hz = (40 * 1000 * 1000),
+        .pclk_hz = (20 * 1000 * 1000),
         .trans_queue_depth = 10,
         .dc_levels = {
             .dc_idle_level = 0,
@@ -708,33 +783,107 @@ void lcd_init(lcd_cfg_t lcd_config)
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i80(i80_bus, &io_config, &io_handle));
+    ret = esp_lcd_new_panel_io_i80(i80_bus, &io_config, &io_handle);
+    if (ret != ESP_OK)
+    {
+        goto cleanup;
+    }
     lcd_io_handle = io_handle;
     
 	/* LCD复位 */
-	LCD_RST(1);
-	vTaskDelay(10);
-	LCD_RST(0);
-	vTaskDelay(50);
-	LCD_RST(1); 
-    vTaskDelay(200);
+	ret = xl9555_pin_write(LCD_RST_IO, 1);
+    if (ret != ESP_OK)
+    {
+        goto cleanup;
+    }
+	vTaskDelay(pdMS_TO_TICKS(10));
+	ret = xl9555_pin_write(LCD_RST_IO, 0);
+    if (ret != ESP_OK)
+    {
+        goto cleanup;
+    }
+	vTaskDelay(pdMS_TO_TICKS(50));
+    ret = xl9555_pin_write(LCD_RST_IO, 1);
+    if (ret != ESP_OK)
+    {
+        goto cleanup;
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
 
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = LCD_NUM_RST,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
         .bits_per_pixel = 16,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_st7796(io_handle, &panel_config, &panel_handle));
+    ret = esp_lcd_new_panel_st7796(io_handle, &panel_config, &panel_handle);
+    if (ret != ESP_OK)
+    {
+        goto cleanup;
+    }
 
-    esp_lcd_panel_reset(panel_handle);                                  /* 复位屏幕 */
-    esp_lcd_panel_init(panel_handle);                                   /* 初始化屏幕 */
-    esp_lcd_panel_invert_color(panel_handle, true);                     /* 开启颜色反转 */
-    esp_lcd_panel_set_gap(panel_handle, 0, 0);                          /* 设置XY偏移 */
-    esp_lcd_panel_io_tx_param(io_handle, 0x36, (uint8_t[]) {0x08}, 1);
-    esp_lcd_panel_io_tx_param(io_handle, 0x3A, (uint8_t[]) {0x55}, 1);
+    ret = esp_lcd_panel_reset(panel_handle);                            /* 复位屏幕 */
+    if (ret != ESP_OK)
+    {
+        goto cleanup;
+    }
+    ret = esp_lcd_panel_init(panel_handle);                             /* 初始化屏幕 */
+    if (ret != ESP_OK)
+    {
+        goto cleanup;
+    }
+    ret = esp_lcd_panel_invert_color(panel_handle, true);               /* 开启颜色反转 */
+    if (ret != ESP_OK)
+    {
+        goto cleanup;
+    }
+    ret = esp_lcd_panel_set_gap(panel_handle, 0, 0);                    /* 设置XY偏移 */
+    if (ret != ESP_OK)
+    {
+        goto cleanup;
+    }
+    ret = esp_lcd_panel_io_tx_param(io_handle, 0x36, (uint8_t[]) {0x08}, 1);
+    if (ret != ESP_OK)
+    {
+        goto cleanup;
+    }
+    ret = esp_lcd_panel_io_tx_param(io_handle, 0x3A, (uint8_t[]) {0x55}, 1);
+    if (ret != ESP_OK)
+    {
+        goto cleanup;
+    }
 
     lcd_display_dir(0);                                                 /* 设置屏幕方向 */
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));     /* 启动屏幕 */
-    lcd_clear(WHITE);                                                   /* 默认填充白色 */
-    LCD_BL(1);                                                          /* 打开背光 */
+    ret = lcd_clear(WHITE);                                             /* 默认填充白色 */
+    if (ret != ESP_OK)
+    {
+        goto cleanup;
+    }
+    ret = esp_lcd_panel_disp_on_off(panel_handle, true);                /* 启动屏幕 */
+    if (ret != ESP_OK)
+    {
+        goto cleanup;
+    }
+    ret = xl9555_pin_write(BL_CTR_IO, 1);                               /* 打开背光 */
+    if (ret == ESP_OK)
+    {
+        return ESP_OK;
+    }
+
+cleanup:
+    if (panel_handle != NULL)
+    {
+        esp_lcd_panel_del(panel_handle);
+        panel_handle = NULL;
+    }
+    if (io_handle != NULL)
+    {
+        esp_lcd_panel_io_del(io_handle);
+        io_handle = NULL;
+        lcd_io_handle = NULL;
+    }
+    if (i80_bus != NULL)
+    {
+        esp_lcd_del_i80_bus(i80_bus);
+    }
+    return ret;
 }

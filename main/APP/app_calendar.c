@@ -111,7 +111,7 @@ void app_calendar_ui_init(void)
 }
 
 /**
- * @brief       计算器界面退出
+ * @brief       日历界面退出
  * @param       无
  * @retval      无
  */
@@ -123,7 +123,7 @@ void lv_calendar_del(void)
         lv_calendar_ui.refresh_timer = NULL;
     }
 
-    /* 删除计算器父类 */
+    /* 删除日历父类 */
     if (lv_calendar_ui.calendar_main_ui != NULL && lv_obj_is_valid(lv_calendar_ui.calendar_main_ui))
     {
         lv_obj_del(lv_calendar_ui.calendar_main_ui);

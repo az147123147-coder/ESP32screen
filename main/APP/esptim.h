@@ -17,8 +17,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
-#include "soc/timer_group_struct.h"
-#include "driver/timer.h"
 #include "esp_timer.h"
 
 

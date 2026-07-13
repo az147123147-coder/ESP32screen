@@ -23,6 +23,7 @@ lv_indev_data_t touch_data;
 #define EXAMPLE_LVGL_TASK_MIN_DELAY_MS  1
 #define EXAMPLE_LVGL_TASK_STACK_SIZE    (8 * 1024)
 #define EXAMPLE_LVGL_TASK_PRIORITY      2
+#define LVGL_DRAW_BUFFER_LINES          30
 
 lv_indev_t *indev_keypad = NULL;        /* 按键组 */
 uint32_t back_act_key = 0;              /* 返回主界面按键 */
@@ -32,7 +33,6 @@ extern uint8_t temp[4];
 extern TaskHandle_t VIDEOTask_Handler;
 extern TaskHandle_t PICTask_Handler;
 extern volatile uint8_t app_file_sd_busy;
-extern bool video_touch_mirrored;
 
 /* SD_TASK 任务 配置
  * 包括: 任务优先级 堆栈大小 任务句柄 创建任务
@@ -42,76 +42,9 @@ extern bool video_touch_mirrored;
 TaskHandle_t SDTask_Handler;                /* 任务句柄 */
 void sd_task(void *pvParameters);
 
-#define UART_TASK_PRIO       3
-#define UART_STK_SIZE        2 * 1024
-TaskHandle_t UARTTask_Handler;
-void uart_task(void *pvParameters);
-
 static SemaphoreHandle_t lvgl_mux = NULL;
 static volatile bool lvgl_flush_pending = false;
-
-#define TEST_CHAR      'a'
-#define SEND_INTERVAL  1000
-#define READ_TIMEOUT   50
-
-/**
- * @brief       uart
- * @param       pvParameters : 传入参数(未用到)
- * @retval      无
- */
-void uart_task(void *pvParameters)
-{
-    pvParameters = pvParameters;
-    uint8_t *rx_buffer = malloc(RX_BUF_SIZE);
-    if (rx_buffer == NULL)
-    {
-        ESP_LOGE(TAG, "uart_task malloc failed");
-        UARTTask_Handler = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
-	while(1) 
-	{
-        /* 发送测试字符 */
-		char tx_char = 'a'; 
-		uart_write_bytes(USART_UX, &tx_char, 1);
-        
-        /* 等待数据完全发送 */
-        uart_wait_tx_done(USART_UX, pdMS_TO_TICKS(50));
-
-        /* 读取回传数据 */
-        int len = uart_read_bytes(USART_UX, rx_buffer, RX_BUF_SIZE, pdMS_TO_TICKS(READ_TIMEOUT));
-        
-        /* 检测接收状态 */
-        if (len > 0) 
-		{
-            /* 遍历接收缓冲区查找目标字符 */ 
-            for (int i = 0; i < len; i++) 
-			{
-                if (rx_buffer[i] == TEST_CHAR) 
-				{
-                    LED1(0);  
-                    break;
-                } 
-				else 
-				{
-                    LED1(1);  
-                }
-            }
-        } 
-		else 
-		{
-            LED1(1);  /* 无数据时熄灭LED */ 
-        }
-
-        /* 清空接收缓冲区 */
-        uart_flush_input(USART_UX);
-        
-        vTaskDelay(pdMS_TO_TICKS(SEND_INTERVAL));
-    }
-	free(rx_buffer);
-}
+static bool lvgl_touch_mirrored = false;
 
 /**
  * @brief       sd
@@ -149,14 +82,10 @@ void sd_task(void *pvParameters)
                     }
                     sd_present_last = 0;
 
-                    if (app_obj_general.del_parent != NULL && app_obj_general.APP_Function != NULL && app_obj_general.requires_sd)
+                    uint32_t close_request_id = lv_request_sd_app_close_from_task();
+                    for (uint8_t i = 0; i < 100; i++)
                     {
-                        app_obj_general.app_state = DEL_STATE;
-                    }
-
-                    for (uint8_t i = 0; i < 60; i++)
-                    {
-                        if (app_obj_general.del_parent == NULL)
+                        if (lv_app_close_request_complete(close_request_id))
                         {
                             break;
                         }
@@ -286,6 +215,7 @@ static void lvgl_port_task(void *arg)
         /* 锁定互斥锁,因为LVGL api不是线程安全的*/
         if (lvgl_mux_lock(-1))
         {
+            lv_process_app_close_requests();
             task_delay_ms = lv_timer_handler();
             /* 使用互斥锁 */
             lvgl_mux_unlock();
@@ -359,7 +289,7 @@ void touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
         data->point.x = tp_dev.x[0]; /* 获取触摸点X坐标 */
         data->point.y = tp_dev.y[0]; /* 获取触摸点Y坐标 */
 
-        if (video_touch_mirrored)
+        if (lvgl_touch_mirrored)
         {
             data->point.x = lcd_dev.width - 1 - data->point.x;
             data->point.y = lcd_dev.height - 1 - data->point.y;
@@ -464,26 +394,43 @@ void lv_port_indev_init(void)
 
 lv_disp_drv_t disp_drv;      /* 回调函数的参数 */
 
+void lvgl_set_display_dir(uint8_t dir, bool flipped)
+{
+    lcd_display_dir(dir);
+    if ((dir == 1) && flipped)
+    {
+        esp_lcd_panel_mirror(panel_handle, true, true);
+    }
+    lvgl_touch_mirrored = (dir == 1) && !flipped;
+    disp_drv.hor_res = lcd_dev.width;
+    disp_drv.ver_res = lcd_dev.height;
+    lv_disp_drv_update(lv_disp_get_default(), &disp_drv);
+
+    tp_dev.touchtype &= (uint8_t)~0x01;
+    tp_dev.touchtype |= lcd_dev.dir & 0x01;
+}
+
 /**
  * @brief       lvgl程序入口
  * @param       无
  * @retval      无
  */
-void lvgl_demo(void)
+esp_err_t lvgl_demo(void)
 {
     static lv_disp_draw_buf_t disp_buf; /* 绘画区域的存储区 */
 	void *buf1 = NULL;
     void *buf2 = NULL;
+    esp_err_t ret;
 
-	buf1 = heap_caps_malloc(lcd_dev.width * 60 * sizeof(lv_color_t), MALLOC_CAP_DMA);
-    buf2 = heap_caps_malloc(lcd_dev.width * 60 * sizeof(lv_color_t), MALLOC_CAP_DMA);
+	buf1 = heap_caps_malloc(lcd_dev.width * LVGL_DRAW_BUFFER_LINES * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    buf2 = heap_caps_malloc(lcd_dev.width * LVGL_DRAW_BUFFER_LINES * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
 
     if (buf1 == NULL || buf2 == NULL)
     {
         heap_caps_free(buf1);
         heap_caps_free(buf2);
         ESP_LOGE(TAG, "Failed to allocate LVGL draw buffers");
-        return;
+        return ESP_ERR_NO_MEM;
     }
 
     lv_init();                          /* 初始化lvgl */
@@ -491,7 +438,7 @@ void lvgl_demo(void)
     /* 输出内存地址 */
     ESP_LOGI(TAG, "buf1@%p, buf2@%p", buf1, buf2);
     /* 初始化绘画存储区 */
-    lv_disp_draw_buf_init(&disp_buf, buf1, buf2, lcd_dev.width * 60);
+    lv_disp_draw_buf_init(&disp_buf, buf1, buf2, lcd_dev.width * LVGL_DRAW_BUFFER_LINES);
 
     lv_disp_drv_init(&disp_drv);
     disp_drv.hor_res = lcd_dev.width;
@@ -500,7 +447,10 @@ void lvgl_demo(void)
     disp_drv.draw_buf = &disp_buf;
     disp_drv.user_data = panel_handle;
     /* 显示设备注册 */
-    lv_disp_drv_register(&disp_drv);
+    if (lv_disp_drv_register(&disp_drv) == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
     /* 触摸设备注册 */
     lv_port_indev_init();
 
@@ -508,8 +458,7 @@ void lvgl_demo(void)
     if (lvgl_mux == NULL)
     {
         ESP_LOGE(TAG, "Failed to create LVGL mutex");
-        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
-        return;
+        return ESP_ERR_NO_MEM;
     }
 
     /* 创建定时器提供lvgl时钟节拍 */
@@ -518,8 +467,17 @@ void lvgl_demo(void)
         .name = "lvgl_tick"
     };
     esp_timer_handle_t lvgl_tick_timer = NULL;
-    ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, EXAMPLE_LVGL_TICK_PERIOD_MS * 1000));
+    ret = esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer);
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
+    ret = esp_timer_start_periodic(lvgl_tick_timer, EXAMPLE_LVGL_TICK_PERIOD_MS * 1000);
+    if (ret != ESP_OK)
+    {
+        esp_timer_delete(lvgl_tick_timer);
+        return ret;
+    }
 
     if (sd_spi_init() == ESP_OK)        /* 初始化TF卡 */
     {
@@ -540,16 +498,18 @@ void lvgl_demo(void)
     else
     {
         ESP_LOGE(TAG, "Failed to lock LVGL mutex");
-        ESP_ERROR_CHECK(ESP_FAIL);
-        return;
+        esp_timer_stop(lvgl_tick_timer);
+        esp_timer_delete(lvgl_tick_timer);
+        return ESP_FAIL;
     }
 
     BaseType_t task_result = xTaskCreatePinnedToCore(lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, EXAMPLE_LVGL_TASK_PRIORITY, NULL, 0);
     if (task_result != pdPASS)
     {
         ESP_LOGE(TAG, "Failed to create LVGL task");
-        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
-        return;
+        esp_timer_stop(lvgl_tick_timer);
+        esp_timer_delete(lvgl_tick_timer);
+        return ESP_ERR_NO_MEM;
     }
 
     task_result = xTaskCreatePinnedToCore((TaskFunction_t )sd_task,
@@ -565,16 +525,5 @@ void lvgl_demo(void)
         ESP_LOGE(TAG, "Failed to create SD task");
     }
 
-    task_result = xTaskCreatePinnedToCore((TaskFunction_t )uart_task,
-                                         (const char*    )"uart_task",
-                                         (uint16_t       )UART_STK_SIZE,
-                                         (void*          )NULL,
-                                         (UBaseType_t    )UART_TASK_PRIO,
-                                         (TaskHandle_t*  )&UARTTask_Handler,
-                                         (BaseType_t     ) 0);
-    if (task_result != pdPASS)
-    {
-        UARTTask_Handler = NULL;
-        ESP_LOGE(TAG, "Failed to create UART task");
-    }
+    return ESP_OK;
 }

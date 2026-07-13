@@ -22,18 +22,51 @@ _calendar_obj calendar;         /* 时间结构体 */
 #define RTC_NVS_NAMESPACE "rtc_time"
 #define RTC_NVS_KEY_LAST_TIME "last_time"
 #define RTC_MIN_VALID_TIME 1704067200LL
+#define RTC_MAX_VALID_TIME 4102444800LL
+#define RTC_SAVE_INTERVAL_MS (10ULL * 60ULL * 1000ULL)
+#define RTC_SAVE_TASK_STACK_SIZE 2048
+
+static TaskHandle_t s_rtc_save_task;
 
 static void rtc_save_time_task(void *arg)
 {
-    rtc_save_current_time();
-    vTaskDelete(NULL);
+    (void)arg;
+
+    while (1)
+    {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(RTC_SAVE_INTERVAL_MS));
+        rtc_save_current_time();
+    }
+}
+
+static void rtc_ensure_save_task(void)
+{
+    if (s_rtc_save_task == NULL &&
+        xTaskCreate(rtc_save_time_task,
+                    "rtc_save",
+                    RTC_SAVE_TASK_STACK_SIZE,
+                    NULL,
+                    3,
+                    &s_rtc_save_task) != pdPASS)
+    {
+        s_rtc_save_task = NULL;
+    }
+}
+
+static void rtc_request_save(void)
+{
+    rtc_ensure_save_task();
+    if (s_rtc_save_task != NULL)
+    {
+        xTaskNotifyGive(s_rtc_save_task);
+    }
 }
 
 static void rtc_sntp_sync_cb(struct timeval *tv)
 {
     if (tv != NULL && tv->tv_sec >= RTC_MIN_VALID_TIME)
     {
-        xTaskCreate(rtc_save_time_task, "rtc_save", 2048, NULL, 3, NULL);
+        rtc_request_save();
     }
 }
 
@@ -41,12 +74,21 @@ void rtc_time_init(void)
 {
     setenv("TZ", "CST-8", 1);
     tzset();
+    rtc_ensure_save_task();
 }
 
 bool rtc_restore_saved_time(void)
 {
     nvs_handle_t handle;
     int64_t saved_time = 0;
+    time_t current_time;
+
+    time(&current_time);
+    if ((int64_t)current_time >= RTC_MIN_VALID_TIME &&
+        (int64_t)current_time <= RTC_MAX_VALID_TIME)
+    {
+        return true;
+    }
 
     if (nvs_open(RTC_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK)
     {
@@ -56,7 +98,8 @@ bool rtc_restore_saved_time(void)
     esp_err_t err = nvs_get_i64(handle, RTC_NVS_KEY_LAST_TIME, &saved_time);
     nvs_close(handle);
 
-    if (err != ESP_OK || saved_time < RTC_MIN_VALID_TIME)
+    if (err != ESP_OK || saved_time < RTC_MIN_VALID_TIME ||
+        saved_time > RTC_MAX_VALID_TIME)
     {
         return false;
     }
@@ -71,7 +114,7 @@ bool rtc_save_current_time(void)
     nvs_handle_t handle;
 
     time(&now);
-    if (now < RTC_MIN_VALID_TIME)
+    if ((int64_t)now < RTC_MIN_VALID_TIME || (int64_t)now > RTC_MAX_VALID_TIME)
     {
         return false;
     }
@@ -119,7 +162,7 @@ void rtc_start_sntp_sync(void)
  */
 void rtc_set_time(int year,int mon,int mday,int hour,int min,int sec)
 {
-    struct tm datetime;
+    struct tm datetime = {0};
     /* 设置时间 */
     datetime.tm_year = year - 1900;
     datetime.tm_mon = mon - 1;
@@ -132,7 +175,10 @@ void rtc_set_time(int year,int mon,int mday,int hour,int min,int sec)
     time_t second = mktime(&datetime);
     struct timeval val = { .tv_sec = second, .tv_usec = 0 };
     /* 设置当前时间 */
-    settimeofday(&val, NULL);
+    if (settimeofday(&val, NULL) == 0)
+    {
+        rtc_request_save();
+    }
 }
 
 /**

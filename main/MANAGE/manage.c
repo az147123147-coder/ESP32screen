@@ -60,21 +60,21 @@ void test_handler(void)
 }
 
 
-#define OTA_PARTITION_LABEL "ota_0" 
-
 esp_err_t execute_bin_file(const char *bin_path) 
 {
+    if (bin_path == NULL || bin_path[0] == '\0')
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     esp_err_t err;
     esp_ota_handle_t update_handle = 0;
-    const esp_partition_t *update_partition = NULL;
-
-    /* 获取OTA分区 */ 
-    update_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, OTA_PARTITION_LABEL);
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
 
     if (!update_partition) 
     {
-        ESP_LOGE("ota_example", "Partition not found");
-        return ESP_FAIL;
+        ESP_LOGE("ota_example", "OTA is not supported by the current partition table");
+        return ESP_ERR_NOT_SUPPORTED;
     }
 
     err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
@@ -84,12 +84,12 @@ esp_err_t execute_bin_file(const char *bin_path)
         return err;
     }
 
-    FILE *f = fopen(bin_path, "r");
+    FILE *f = fopen(bin_path, "rb");
     if (!f) 
     {
         ESP_LOGE("ota_example", "Failed to open binary file");
         ESP_LOGI("ota_example", "Attempting to open file: %s", bin_path);
-        esp_ota_end(update_handle);
+        esp_ota_abort(update_handle);
         return ESP_FAIL;
     }
 
@@ -101,9 +101,16 @@ esp_err_t execute_bin_file(const char *bin_path)
         if (err != ESP_OK) {
             ESP_LOGE("ota_example", "esp_ota_write failed! err = %d", err);
             fclose(f);
-            esp_ota_end(update_handle);
+            esp_ota_abort(update_handle);
             return err;
         }
+    }
+
+    if (ferror(f))
+    {
+        fclose(f);
+        esp_ota_abort(update_handle);
+        return ESP_FAIL;
     }
 
     fclose(f);

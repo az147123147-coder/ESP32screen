@@ -30,7 +30,6 @@
  #define RX_BUF_SIZE         1024    /* 环形缓冲区大小 */
  
  /* 函数声明 */
- void usart_init(uint32_t baudrate); /* 初始化串口 */
- 
- #endif
- 
+ esp_err_t usart_init(uint32_t baudrate); /* 初始化串口 */
+
+#endif

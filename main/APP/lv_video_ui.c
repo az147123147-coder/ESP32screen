@@ -61,7 +61,6 @@ static volatile video_stat_t video_pending_key = VIDEO_NULL;
 static bool video_sd_session = false;
 static lv_timer_t *video_close_timer = NULL;
 static int64_t video_frame_start = 0;
-bool video_touch_mirrored = false;
 static void video_finish_close(void);
 static void video_close_timer_cb(lv_timer_t *timer);
 #define VIDEO_DIRECT_LCD_DRAW 0
@@ -82,11 +81,7 @@ static void video_sd_lost(void)
 {
     lv_smail_icon_clear_state(TF_STATE);
     video_cfig.video_start = 0;
-
-    if (app_obj_general.del_parent != NULL && app_obj_general.APP_Function != NULL)
-    {
-        app_obj_general.app_state = DEL_STATE;
-    }
+    lv_request_active_app_close_from_task(lv_video_del);
 }
 
 static uint8_t video_file_read(FIL *fp, void *buf, UINT btr, UINT *br)
@@ -152,27 +147,12 @@ static void video_apply_key(uint8_t key)
 
 static void video_set_display_dir(uint8_t dir, uint8_t flipped)
 {
-    lcd_display_dir(dir);
 #if VIDEO_LANDSCAPE_FLIPPED
-    if ((dir == 1) && flipped)
-    {
-        esp_lcd_panel_mirror(panel_handle, true, true);
-        video_touch_mirrored = true;
-    }
-    else
-    {
-        video_touch_mirrored = false;
-    }
+    lvgl_set_display_dir(dir, flipped != 0);
 #else
     (void)flipped;
-    video_touch_mirrored = false;
+    lvgl_set_display_dir(dir, false);
 #endif
-    disp_drv.hor_res = lcd_dev.width;
-    disp_drv.ver_res = lcd_dev.height;
-    lv_disp_drv_update(lv_disp_get_default(), &disp_drv);
-
-    tp_dev.touchtype &= (uint8_t)~0x01;
-    tp_dev.touchtype |= lcd_dev.dir & 0x01;
 }
 
 static void video_disable_scroll(lv_obj_t *obj)
@@ -609,24 +589,6 @@ void video_time_show(FIL *favi, AVI_INFO *aviinfo)
 }
 
 /**
- * @brief       转换
- * @param       fs:文件系统对象
- * @param       clst:转换
- * @retval      =0:扇区号，0:失败
- */
-static LBA_t atk_clst2sect(FATFS *fs, DWORD clst)
-{
-    clst -= 2;  /* Cluster number is origin from 2 */
-
-    if (clst >= fs->n_fatent - 2)
-    {
-        return 0;   /* Is it invalid cluster number? */
-    }
-
-    return fs->database + (LBA_t)fs->csize * clst;  /* Start sector number of the cluster */
-}
-
-/**
  * @brief       偏移
  * @param       dp:指向目录对象
  * @param       Offset:目录表的偏移量
@@ -634,8 +596,16 @@ static LBA_t atk_clst2sect(FATFS *fs, DWORD clst)
  */
 FRESULT atk_video_dir_sdi(FF_DIR *dp, DWORD ofs)
 {
-    DWORD clst;
-    FATFS *fs = dp->obj.fs;
+    FILINFO skipped;
+    FRESULT res;
+    FATFS *fs;
+
+    if (dp == NULL || dp->obj.fs == NULL)
+    {
+        return FR_INVALID_OBJECT;
+    }
+
+    fs = dp->obj.fs;
 
     if (ofs >= (DWORD)((FF_FS_EXFAT && fs->fs_type == FS_EXFAT) ? 0x10000000 : 0x200000) || ofs % 32)
     {
@@ -643,46 +613,32 @@ FRESULT atk_video_dir_sdi(FF_DIR *dp, DWORD ofs)
         return FR_INT_ERR;
     }
 
-    dp->dptr = ofs;         /* Set current offset */
-    clst = dp->obj.sclust;  /* Table start cluster (0:root) */
-
-    if (clst == 0 && fs->fs_type >= FS_FAT32)
-    {	/* Replace cluster# 0 with root cluster# */
-        clst = (DWORD)fs->dirbase;
-
-        if (FF_FS_EXFAT)
-        {
-            dp->obj.stat = 0;
-        }
-        /* exFAT: Root dir has an FAT chain */
-    }
-
-    if (clst == 0)
-    {	/* Static table (root-directory on the FAT volume) */
-        if (ofs / 32 >= fs->n_rootdir)
-        {
-            return FR_INT_ERR;  /* Is index out of range? */
-        }
-
-        dp->sect = fs->dirbase;
-
-    }
-    else
-    {   /* Dynamic table (sub-directory or root-directory on the FAT32/exFAT volume) */
-        dp->sect = atk_clst2sect(fs, clst);
-    }
-
-    dp->clust = clst;   /* Current cluster# */
-
-    if (dp->sect == 0)
+    if (dp->dptr == ofs)
     {
-        return FR_INT_ERR;
+        return FR_OK;
     }
 
-    dp->sect += ofs / fs->ssize;             /* Sector# of the directory entry */
-    dp->dir = fs->win + (ofs % fs->ssize);   /* Pointer to the entry in the win[] */
+    res = f_readdir(dp, NULL);
+    if (res != FR_OK)
+    {
+        return res;
+    }
 
-    return FR_OK;
+    while (dp->dptr < ofs)
+    {
+        skipped.fname[0] = '\0';
+        res = f_readdir(dp, &skipped);
+        if (res != FR_OK)
+        {
+            return res;
+        }
+        if (skipped.fname[0] == '\0')
+        {
+            return FR_INT_ERR;
+        }
+    }
+
+    return dp->dptr == ofs ? FR_OK : FR_INT_ERR;
 }
 
 static uint8_t video_dir_open_retry(FF_DIR *dir, const TCHAR *path)
@@ -716,7 +672,11 @@ static uint8_t video_dir_seek_read_retry(FF_DIR *dir, DWORD ofs, FILINFO *info)
         }
         else
         {
-            res = (uint8_t)atk_video_dir_sdi(dir, ofs);
+            res = retry > 0 ? (uint8_t)f_readdir(dir, NULL) : FR_OK;
+            if (res == FR_OK)
+            {
+                res = (uint8_t)atk_video_dir_sdi(dir, ofs);
+            }
             if (res == FR_OK)
             {
                 res = (uint8_t)f_readdir(dir, info);
@@ -1185,10 +1145,7 @@ video_file_cleanup:
                     {
                         video_cfig.video_start = 0;
                         key = VIDEO_NULL;
-                        if (app_obj_general.del_parent != NULL && app_obj_general.APP_Function != NULL)
-                        {
-                            app_obj_general.app_state = DEL_STATE;
-                        }
+                        lv_request_active_app_close_from_task(lv_video_del);
                     }
                     else
                     {

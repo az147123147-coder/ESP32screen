@@ -29,7 +29,7 @@ extern lv_indev_t *indev_keypad;    /* 按键组 */
  */
 #define PIC_PRIO      2                                 /* task priority */
 #define PIC_STK_SIZE  5 * 1024                          /* task stack size */
-#define PHOTO_CACHE_MAGIC 0x50353635U
+#define PHOTO_CACHE_MAGIC 0x50353636U
 #define PHOTO_CACHE_PATH_SIZE (255 * 2 + 8)
 TaskHandle_t          PICTask_Handler;                  /* task handle */
 extern TaskHandle_t VIDEOTask_Handler;
@@ -49,6 +49,7 @@ typedef struct
     uint32_t src_size;
     uint16_t src_date;
     uint16_t src_time;
+    uint32_t src_checksum;
 } photo_cache_header_t;
 
 static bool photo_cache_save_enabled = false;
@@ -103,83 +104,6 @@ uint16_t pic_get_tnum(char *path)
     return rval;
 }
 
-/**
- * @brief       转换
- * @param       fs:文件系统对象
- * @param       clst:转换
- * @retval      =0:扇区号，0:失败
- */
-static LBA_t atk_clst2sect(FATFS *fs, DWORD clst)
-{
-    clst -= 2;  /* Cluster number is origin from 2 */
-
-    if (clst >= fs->n_fatent - 2)
-    {
-        return 0;   /* Is it invalid cluster number? */
-    }
-
-    return fs->database + (LBA_t)fs->csize * clst;  /* Start sector number of the cluster */
-}
-
-/**
- * @brief       偏移
- * @param       dp:指向目录对象
- * @param       Offset:目录表的偏移量
- * @retval      FR_OK(0):成功，!=0:错误
- */
-FRESULT atk_photo_dir_sdi(FF_DIR *dp, DWORD ofs)
-{
-    DWORD clst;
-    FATFS *fs = dp->obj.fs;
-
-    if (ofs >= (DWORD)((FF_FS_EXFAT && fs->fs_type == FS_EXFAT) ? 0x10000000 : 0x200000) || ofs % 32)
-    {
-        /* Check range of offset and alignment */
-        return FR_INT_ERR;
-    }
-
-    dp->dptr = ofs;         /* Set current offset */
-    clst = dp->obj.sclust;  /* Table start cluster (0:root) */
-
-    if (clst == 0 && fs->fs_type >= FS_FAT32)
-    {	/* Replace cluster# 0 with root cluster# */
-        clst = (DWORD)fs->dirbase;
-
-        if (FF_FS_EXFAT)
-        {
-            dp->obj.stat = 0;
-        }
-        /* exFAT: Root dir has an FAT chain */
-    }
-
-    if (clst == 0)
-    {	/* Static table (root-directory on the FAT volume) */
-        if (ofs / 32 >= fs->n_rootdir)
-        {
-            return FR_INT_ERR;  /* Is index out of range? */
-        }
-
-        dp->sect = fs->dirbase;
-
-    }
-    else
-    {   /* Dynamic table (sub-directory or root-directory on the FAT32/exFAT volume) */
-        dp->sect = atk_clst2sect(fs, clst);
-    }
-
-    dp->clust = clst;   /* Current cluster# */
-
-    if (dp->sect == 0)
-    {
-        return FR_INT_ERR;
-    }
-
-    dp->sect += ofs / fs->ssize;             /* Sector# of the directory entry */
-    dp->dir = fs->win + (ofs % fs->ssize);   /* Pointer to the entry in the win[] */
-
-    return FR_OK;
-}
-
 lv_img_dsc_t img_pic_dsc = {
     .header.always_zero = 0,
     .header.cf = LV_IMG_CF_TRUE_COLOR,
@@ -199,11 +123,7 @@ static void photo_sd_lost(void)
     lv_smail_icon_clear_state(TF_STATE);
     photo_switching = false;
     photo_cfig.pic_start = 0;
-
-    if (app_obj_general.del_parent != NULL && app_obj_general.APP_Function != NULL)
-    {
-        app_obj_general.app_state = DEL_STATE;
-    }
+    lv_request_active_app_close_from_task(lv_pic_del);
 }
 
 static bool lv_photo_is_supported_type(uint8_t type)
@@ -234,8 +154,10 @@ static bool lv_photo_make_cache_path(const char *src, char *dst, size_t dst_size
     switch (exfuns_file_type((char *)src))
     {
         case T_JPG:
-        case T_JPEG:
             cache_ext = ".J56";
+            break;
+        case T_JPEG:
+            cache_ext = ".E56";
             break;
         case T_PNG:
             cache_ext = ".P56";
@@ -294,6 +216,55 @@ static bool lv_photo_get_src_info(const char *src, uint32_t *src_size, uint16_t 
     return true;
 }
 
+static bool lv_photo_get_src_checksum(const char *src, uint32_t *src_checksum)
+{
+    FIL *fp;
+    FRESULT res;
+    UINT br;
+    uint8_t buf[512];
+    uint32_t hash = 2166136261U;
+
+    fp = (FIL *)malloc(sizeof(FIL));
+    if (fp == NULL)
+    {
+        return false;
+    }
+
+    res = sd_f_open(fp, src, FA_READ);
+    if (res != FR_OK)
+    {
+        free(fp);
+        return false;
+    }
+
+    do
+    {
+        br = 0;
+        res = sd_f_read(fp, buf, sizeof(buf), &br);
+        if (res != FR_OK)
+        {
+            break;
+        }
+
+        for (UINT i = 0; i < br; i++)
+        {
+            hash ^= buf[i];
+            hash *= 16777619U;
+        }
+    } while (br == sizeof(buf));
+
+    sd_f_close(fp);
+    free(fp);
+
+    if (res != FR_OK)
+    {
+        return false;
+    }
+
+    *src_checksum = hash;
+    return true;
+}
+
 static bool lv_photo_cache_header_valid(const photo_cache_header_t *header, uint16_t target_w, uint16_t target_h, uint32_t src_size, uint16_t src_date, uint16_t src_time)
 {
     uint32_t data_size;
@@ -321,6 +292,7 @@ static bool lv_photo_cache_header_valid(const photo_cache_header_t *header, uint
 static void lv_photo_cache_begin(const char *src, uint16_t target_w, uint16_t target_h)
 {
     uint32_t src_size;
+    uint32_t src_checksum;
     uint16_t src_date;
     uint16_t src_time;
 
@@ -336,6 +308,11 @@ static void lv_photo_cache_begin(const char *src, uint16_t target_w, uint16_t ta
         return;
     }
 
+    if (!lv_photo_get_src_checksum(src, &src_checksum))
+    {
+        return;
+    }
+
     photo_cache_header.magic = PHOTO_CACHE_MAGIC;
     photo_cache_header.target_w = target_w;
     photo_cache_header.target_h = target_h;
@@ -346,6 +323,7 @@ static void lv_photo_cache_begin(const char *src, uint16_t target_w, uint16_t ta
     photo_cache_header.src_size = src_size;
     photo_cache_header.src_date = src_date;
     photo_cache_header.src_time = src_time;
+    photo_cache_header.src_checksum = src_checksum;
     photo_cache_save_enabled = true;
 }
 
@@ -426,6 +404,7 @@ static bool lv_photo_cache_load(const char *src, uint16_t target_w, uint16_t tar
     UINT br = 0;
     uint8_t *buf;
     uint32_t src_size;
+    uint32_t src_checksum;
     uint16_t src_date;
     uint16_t src_time;
     photo_cache_header_t header;
@@ -462,6 +441,13 @@ static bool lv_photo_cache_load(const char *src, uint16_t target_w, uint16_t tar
         {
             sd_f_close(fp);
         }
+        free(fp);
+        return false;
+    }
+
+    if (!lv_photo_get_src_checksum(src, &src_checksum) || header.src_checksum != src_checksum)
+    {
+        sd_f_close(fp);
         free(fp);
         return false;
     }
@@ -676,7 +662,17 @@ void pic(void *pvParameters)
             {
                 photo_cfig.pic_totpicnum = pic_get_tnum("0:/PICTURE");
                 photo_switching = false;
+                consecutive_failures++;
                 photo_cfig.pic_curindex++;
+
+                if (photo_cfig.pic_totpicnum == 0 || consecutive_failures >= photo_cfig.pic_totpicnum)
+                {
+                    photo_cfig.pic_start = 0;
+                    lv_request_active_app_close_from_task(lv_pic_del);
+                    photo_sd_session_release();
+                    PICTask_Handler = NULL;
+                    vTaskDelete(NULL);
+                }
 
                 if (photo_cfig.pic_curindex >= photo_cfig.pic_totpicnum)
                 {
@@ -745,12 +741,14 @@ void pic(void *pvParameters)
                     if (consecutive_failures >= photo_cfig.pic_totpicnum)
                     {
                         photo_cfig.pic_start = 0;
-                        photo_sd_session_release();
+                        photo_switching = false;
                         if (!photo_closing && lvgl_mux_lock(200))
                         {
                             lv_msgbox("No decodable images");
                             lvgl_mux_unlock();
                         }
+                        lv_request_active_app_close_from_task(lv_pic_del);
+                        photo_sd_session_release();
                         PICTask_Handler = NULL;
                         vTaskDelete(NULL);
                     }
@@ -765,13 +763,26 @@ void pic(void *pvParameters)
                 }
                 consecutive_failures = 0;
             }
+            else
+            {
+                consecutive_failures++;
+                if (consecutive_failures >= photo_cfig.pic_totpicnum)
+                {
+                    photo_cfig.pic_start = 0;
+                    photo_switching = false;
+                    lv_request_active_app_close_from_task(lv_pic_del);
+                    photo_sd_session_release();
+                    PICTask_Handler = NULL;
+                    vTaskDelete(NULL);
+                }
+            }
 
             while (photo_cfig.pic_start)
             {
-                while (lv_smail_icon_get_state(TF_STATE) == 0 && photo_cfig.pic_start == 0x01)
+                if (lv_smail_icon_get_state(TF_STATE) == 0 && photo_cfig.pic_start == 0x01)
                 {
-                    app_obj_general.app_state = DEL_STATE;
-                    vTaskDelay(10);
+                    photo_sd_lost();
+                    break;
                 }
 
                 if (photo_cfig.pic_state == PIC_PREV)

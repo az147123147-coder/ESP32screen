@@ -131,20 +131,21 @@ esp_err_t xl9555_write_byte(uint8_t reg, uint8_t *data, size_t len)
  * @param       val     : 电平
  * @retval      返回所有IO状态
  */
-uint16_t xl9555_pin_write(uint16_t pin, int val)
+esp_err_t xl9555_pin_write(uint16_t pin, int val)
 {
     if (!xl9555_lock())
     {
-        return xl9555_output_shadow;
+        return ESP_ERR_TIMEOUT;
     }
 
     if (!xl9555_output_shadow_valid)
     {
         uint8_t current[2];
-        if (xl9555_read_byte(current, sizeof(current)) != ESP_OK)
+        esp_err_t ret = xl9555_read_byte(current, sizeof(current));
+        if (ret != ESP_OK)
         {
             xl9555_unlock();
-            return xl9555_output_shadow;
+            return ret;
         }
     }
 
@@ -159,13 +160,10 @@ uint16_t xl9555_pin_write(uint16_t pin, int val)
     }
 
     uint8_t output[2] = {(uint8_t)next, (uint8_t)(next >> 8)};
-    if (xl9555_write_byte(XL9555_OUTPUT_PORT0_REG, output, sizeof(output)) != ESP_OK)
-    {
-        next = xl9555_output_shadow;
-    }
+    esp_err_t ret = xl9555_write_byte(XL9555_OUTPUT_PORT0_REG, output, sizeof(output));
 
     xl9555_unlock();
-    return next;
+    return ret;
 }
 
 /**
@@ -269,7 +267,7 @@ esp_err_t xl9555_init(void)
         return ret;
     }
     /* 配置那些扩展管脚为输入输出模式 */
-    ret = xl9555_ioconfig(0xF003);
+    ret = xl9555_ioconfig(0xF000);
     if (ret != ESP_OK)
     {
         return ret;

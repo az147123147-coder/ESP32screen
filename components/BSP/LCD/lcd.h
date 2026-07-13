@@ -94,10 +94,10 @@ typedef struct _lcd_obj_t
     uint16_t        wramcmd;        /* 开始写gram指令 */
     uint16_t        setxcmd;        /* 设置x坐标指令 */
     uint16_t        setycmd;        /* 设置y坐标指令 */
-    uint16_t        wr;             /* 命令/数据IO */
-    uint16_t        cs;             /* 片选IO */
-    uint16_t        dc;             /* dc */
-    uint16_t        rd;             /* rd */
+    gpio_num_t      wr;             /* 命令/数据IO */
+    gpio_num_t      cs;             /* 片选IO */
+    gpio_num_t      dc;             /* dc */
+    gpio_num_t      rd;             /* rd */
 } lcd_obj_t;
 
 /* lcd配置结构体 */
@@ -112,8 +112,8 @@ typedef struct _lcd_config_t
 extern lcd_obj_t lcd_dev;
 extern esp_lcd_panel_handle_t panel_handle; /* LCD句柄 */
 /* lcd相关函数 */
-void lcd_init(lcd_cfg_t lcd_config);                                                                                    /* 初始化lcd */
-void lcd_clear(uint16_t color);                                                                                         /* 清除屏幕 */
+esp_err_t lcd_init(lcd_cfg_t lcd_config);                                                                               /* 初始化lcd */
+esp_err_t lcd_clear(uint16_t color);                                                                                    /* 清除屏幕 */
 void lcd_display_dir(uint8_t dir);                                                                                      /* lcd显示方向设置 */
 void lcd_draw_point(uint16_t x, uint16_t y, uint16_t color);                                                            /* lcd画点函数 */
 void lcd_fill(uint16_t sx, uint16_t sy, uint16_t ex, uint16_t ey, uint16_t color);

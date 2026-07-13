@@ -30,4 +30,5 @@ extern spi_device_handle_t MY_SD_Handle;	/* SD卡句柄 */
 
 /* 函数声明 */
 esp_err_t my_spi_init(void);    			/* SPI初始化 */
+esp_err_t my_spi_clock_bytes(size_t byte_count);
 #endif

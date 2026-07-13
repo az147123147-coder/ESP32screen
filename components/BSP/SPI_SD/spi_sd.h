@@ -17,9 +17,10 @@
  #include <stdbool.h>
  #include "esp_vfs_fat.h"
  #include "driver/sdspi_host.h"
- #include "driver/spi_common.h"
- #include "sdmmc_cmd.h"
+#include "driver/spi_common.h"
+#include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "diskio.h"
  #include "my_spi.h"

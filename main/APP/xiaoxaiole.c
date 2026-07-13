@@ -837,91 +837,71 @@
 
      for(int i = 0; i < 8; i++)
 	 {
-		 for(int j = 7; j > 0; j--) 
-		 {
-			 if(game_obj[j][i].alive == 0) 
-			 {
-				 /* 向下填充空位 */
-				 for(int k = j; k > 0; k--) 
-				 {
-					 game_obj[k][i].alive = game_obj[k-1][i].alive;
-					 game_obj[k][i].obj = game_obj[k-1][i].obj;
-					 game_obj[k][i].color_index = game_obj[k-1][i].color_index;
-					 
-                     if(game_obj[k][i].alive && lv_obj_is_valid(game_obj[k][i].obj))
-                     {
-                         game_obj[k][i].obj->user_data = &game_obj[k][i];
-						 /* 创建下落动画 */
-						 lv_anim_t a1;
-						 lv_anim_init(&a1);
-                         lv_anim_set_var(&a1, game_obj[k][i].obj);
-                         lv_anim_set_exec_cb(&a1, y_move_cb);
-                         lv_anim_set_time(&a1, 150);
-                         lv_anim_set_values(&a1, (k-1)*35*screen_ratio+1, k*35*screen_ratio+1);
-                         if(!game_anim_start_item(&a1, GAME_ANIM_FALL, move_deleted_cb))
-                         {
-                             lv_obj_set_y(game_obj[k][i].obj, k*35*screen_ratio+1);
-                         }
-                     }
-                     else if(game_obj[k][i].alive)
-                     {
-                         game_obj[k][i].alive = 0;
-                     }
-				 }
-				 
-				 /* 生成新对象 */
-				 game_obj[0][i].x = i;
-				 game_obj[0][i].y = 0;
-				 game_obj[0][i].alive = 1;
-				 game_obj[0][i].color_index = rand()%7;
-				 game_obj[0][i].obj = lv_btn_create(game_window);
-				 lv_obj_set_pos(game_obj[0][i].obj, i*35*screen_ratio+1, -1*35*screen_ratio+1);
-				 lv_obj_set_size(game_obj[0][i].obj, 35*screen_ratio-2, 35*screen_ratio-2);
-				 lv_obj_set_style_bg_color(game_obj[0][i].obj, lv_color_hex(color_lib[game_obj[0][i].color_index]), 0);
-				 game_obj[0][i].obj->user_data = &game_obj[0][i];
-                 lv_obj_add_event_cb(game_obj[0][i].obj, move_obj_cb, LV_EVENT_PRESSED, 0);
-                 lv_obj_add_event_cb(game_obj[0][i].obj, move_obj_cb, LV_EVENT_RELEASED, 0);
-				 
-				 /* 新对象下落动画 */
-				 lv_anim_t a;
-				 lv_anim_init(&a);
-                 lv_anim_set_var(&a, game_obj[0][i].obj);
+         int write_row = 7;
+
+         for(int read_row = 7; read_row >= 0; read_row--)
+         {
+             if(!game_obj[read_row][i].alive || !lv_obj_is_valid(game_obj[read_row][i].obj))
+             {
+                 continue;
+             }
+
+             lv_obj_t *obj = game_obj[read_row][i].obj;
+             int32_t start_y = lv_obj_get_y(obj);
+             if(write_row != read_row)
+             {
+                 game_obj[write_row][i] = game_obj[read_row][i];
+             }
+             game_obj[write_row][i].x = i;
+             game_obj[write_row][i].y = write_row;
+             game_obj[write_row][i].alive = 1;
+             lv_obj_set_user_data(obj, &game_obj[write_row][i]);
+
+             int32_t final_y = write_row * 35 * screen_ratio + 1;
+             if(start_y != final_y)
+             {
+                 lv_anim_t a;
+                 lv_anim_init(&a);
+                 lv_anim_set_var(&a, obj);
                  lv_anim_set_exec_cb(&a, y_move_cb);
                  lv_anim_set_time(&a, 150);
-                 lv_anim_set_values(&a, (-1)*35*screen_ratio+1, 0*35*screen_ratio+1);
+                 lv_anim_set_values(&a, start_y, final_y);
                  if(!game_anim_start_item(&a, GAME_ANIM_FALL, move_deleted_cb))
                  {
-                     lv_obj_set_y(game_obj[0][i].obj, 1);
+                     lv_obj_set_y(obj, final_y);
                  }
-                 break;
-			 }
-		 }
-		 
-		 /* 处理首行空位 */
-		 if(game_obj[0][i].alive == 0) 
-		 {
-			 game_obj[0][i].x = i;
-			 game_obj[0][i].y = 0;
-			 game_obj[0][i].alive = 1;
-			 game_obj[0][i].color_index = rand()%7;
-			 game_obj[0][i].obj = lv_btn_create(game_window);
-			 lv_obj_set_pos(game_obj[0][i].obj, i*35*screen_ratio+1, -1*35*screen_ratio+1);
-			 lv_obj_set_size(game_obj[0][i].obj, 35*screen_ratio-2, 35*screen_ratio-2);
-			 lv_obj_set_style_bg_color(game_obj[0][i].obj, lv_color_hex(color_lib[game_obj[0][i].color_index]), 0);
-			 game_obj[0][i].obj->user_data = &game_obj[0][i];
-             lv_obj_add_event_cb(game_obj[0][i].obj, move_obj_cb, LV_EVENT_PRESSED, 0);
-             lv_obj_add_event_cb(game_obj[0][i].obj, move_obj_cb, LV_EVENT_RELEASED, 0);
-			 
-			 /* 新对象下落动画 */
-			 lv_anim_t a2;
-			 lv_anim_init(&a2);
-             lv_anim_set_var(&a2, game_obj[0][i].obj);
-             lv_anim_set_exec_cb(&a2, y_move_cb);
-             lv_anim_set_time(&a2, 150);
-             lv_anim_set_values(&a2, (-1)*35*screen_ratio+1, 0*35*screen_ratio+1);
-             if(!game_anim_start_item(&a2, GAME_ANIM_FALL, move_deleted_cb))
+             }
+
+             write_row--;
+         }
+
+         int new_count = write_row + 1;
+         for(int row = 0; row < new_count; row++)
+         {
+             game_obj[row][i].x = i;
+             game_obj[row][i].y = row;
+             game_obj[row][i].alive = 1;
+             game_obj[row][i].color_index = rand() % 7;
+             game_obj[row][i].obj = lv_btn_create(game_window);
+
+             int32_t start_y = (row - new_count) * 35 * screen_ratio + 1;
+             int32_t final_y = row * 35 * screen_ratio + 1;
+             lv_obj_set_pos(game_obj[row][i].obj, i * 35 * screen_ratio + 1, start_y);
+             lv_obj_set_size(game_obj[row][i].obj, 35 * screen_ratio - 2, 35 * screen_ratio - 2);
+             lv_obj_set_style_bg_color(game_obj[row][i].obj, lv_color_hex(color_lib[game_obj[row][i].color_index]), 0);
+             lv_obj_set_user_data(game_obj[row][i].obj, &game_obj[row][i]);
+             lv_obj_add_event_cb(game_obj[row][i].obj, move_obj_cb, LV_EVENT_PRESSED, 0);
+             lv_obj_add_event_cb(game_obj[row][i].obj, move_obj_cb, LV_EVENT_RELEASED, 0);
+
+             lv_anim_t a;
+             lv_anim_init(&a);
+             lv_anim_set_var(&a, game_obj[row][i].obj);
+             lv_anim_set_exec_cb(&a, y_move_cb);
+             lv_anim_set_time(&a, 150);
+             lv_anim_set_values(&a, start_y, final_y);
+             if(!game_anim_start_item(&a, GAME_ANIM_FALL, move_deleted_cb))
              {
-                 lv_obj_set_y(game_obj[0][i].obj, 1);
+                 lv_obj_set_y(game_obj[row][i].obj, final_y);
              }
          }
      }

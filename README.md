@@ -1,9 +1,11 @@
 # ESP32-S3 3.5寸触摸屏综合工程
 
+这是一个面向 ESP32-S3 触摸屏的多功能桌面工程，集成应用启动器、图片与视频播放、计算器、日历、WiFi 时间同步，以及通过蓝牙显示 Windows 端 Codex 和 Claude 运行状态的 AI 状态面板。
+
 本项目基于 [ESP32-S3-LVGL-Board](https://github.com/ConstStrings/ESP32-S3-LVGL-Board) 二次开发，
 适配 ESP32-S3 N16R8 3.5 寸电容触摸屏开发套件。
 
-工程使用 ESP-IDF + LVGL，当前工程名为 `synthesis`，主要功能包括主界面、相册、视频播放、WiFi、日历和网络时间同步等。
+工程使用 ESP-IDF + LVGL，当前工程名为 `synthesis`，主要功能包括主界面、相册、视频播放、计算器、日历、WiFi、网络时间同步和 AI 状态显示等。
 
 ## 来源说明
 
@@ -17,7 +19,7 @@
 - 屏幕：3.5 寸 480x320 电容触摸屏
 - 扩展 IO：XL9555
 - 存储：SD 卡，SPI 驱动
-- 开发框架：ESP-IDF 5.4.1
+- 开发框架：ESP-IDF 6.0.1
 
 ## 工程目录
 
@@ -27,6 +29,7 @@ synthesis/
 ├── main/                # 应用代码
 ├── managed_components/  # ESP-IDF 组件管理器生成目录
 ├── build/               # 编译生成目录
+├── tools/               # PC 端 AI 状态 BLE 桥接程序
 ├── sdkconfig            # 当前工程配置
 ├── sdkconfig.defaults   # 关键硬件配置默认值
 └── partitions-16MiB.csv # 分区表
@@ -48,6 +51,53 @@ SD:/
 
 目录名建议全部大写，和代码里的路径保持一致。
 
+## AI 状态应用
+
+“AI 状态”应用通过 Bluetooth LE 接收 Windows 电脑上的 Codex 和 Claude 状态，不依赖 WiFi。ESP32 负责配对、保存绑定关系和显示状态，PC 端的 `PcAiBleBridge.exe` 负责读取本机状态并发送给屏幕。
+
+界面显示内容：
+
+- Codex 和 Claude 的总体状态：`OFF`、`IDLE`、`BUSY` 或 `UNKNOWN`。。
+- Codex 任务状态：`OFF`、`IDLE`、`BUSY`、`WAIT`、`DONE`、`FAILED` 或 `STALE`。
+- `DONE` 任务保留约 5 分钟，`FAILED` 任务保留约 1 分钟。
+- 状态使用不同颜色区分：空闲为绿色、忙碌为蓝色、等待为黄色、完成为青绿色、失败为红色，关闭和过期状态为灰色。
+
+### 构建 PC 桥接程序
+
+桥接工具位于 `tools/pc_ai_ble_bridge/`。Windows PowerShell 的脚本执行策略可能阻止 `build.ps1`，因此建议直接运行不受该策略影响的 `build.cmd`：
+
+```powershell
+Set-Location .\tools\pc_ai_ble_bridge
+.\build.cmd --overwrite
+```
+
+构建成功后会生成：
+
+```text
+tools/pc_ai_ble_bridge/bin/PcAiBleBridge.exe
+```
+
+构建脚本使用 Windows 自带的 .NET Framework C# 编译器和 Windows Bluetooth API，不需要修改 PowerShell 执行策略。
+
+### 首次配对和使用
+
+1. 烧录并启动 ESP32 工程，在主界面打开“AI 状态”应用。
+2. 点击屏幕上的 `PAIR`，进入限时配对状态。
+3. 打开 Windows“设置 > 蓝牙和其他设备 > 添加设备 > 蓝牙 > 显示所有设备”，选择 `ESP32-AI-Status`，按屏幕和 Windows 提示确认配对码。
+4. 配对成功后，屏幕会短暂显示约 3 秒的 `BONDED`。
+5. 运行：`PcAiBleBridge.exe`
+
+
+桥接程序会优先查找已经在 Windows 中配对的屏幕，连接成功后约每 2 秒同步一次状态。一个用户会话只能运行一个桥接程序实例，按 `Ctrl+C` 可以停止。
+
+以后使用时，只需打开屏幕上的“AI 状态”应用并运行 `PcAiBleBridge.exe`，不需要重复配对。
+
+如果 Windows 显示已经配对但桥接程序始终无法发现服务，请先停止桥接程序，在 Windows 蓝牙设置中删除 `ESP32-AI-Status`，再点击屏幕上的 `FORGET`，随后重新执行上述配对步骤。
+
+效果图:
+![alt text](cfdf7d676a8d1852d4a3e25deebca865-3.jpg)
+
+
 ## 视频文件
 
 视频功能读取 `SD:/VIDEO/` 目录下的视频文件。
@@ -68,10 +118,6 @@ SD:/
 - 长按四个角任意一个热区：返回主界面
 - 单个视频播放结束后：自动从头循环播放
 
-当前视频播放做过长期播放优化：
-
-- 移除了视频路径里没有实际使用的帧定时器，避免长时间循环播放后产生无意义周期回调。
-- 同分辨率视频会复用解码输出缓冲，减少反复申请/释放大块内存导致的碎片风险。
 
 ## 相册文件
 

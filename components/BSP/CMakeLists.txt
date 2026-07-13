@@ -25,10 +25,16 @@ set(include_dirs
 			)
             
 set(requires
-            driver
             esp_lcd
+            esp_driver_gpio
+            esp_driver_i2c
+            esp_driver_spi
+            esp_driver_sdspi
+            esp_driver_sdmmc
+            esp_driver_uart
+            sdmmc
             fatfs
-            newlib
+            esp_libc
             esp_timer
             nvs_flash
             lwip)

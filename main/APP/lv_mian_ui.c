@@ -34,6 +34,7 @@ LV_IMG_DECLARE(cell)
 
 /* 声明字体 */
 LV_FONT_DECLARE(Font11chn)          /* 声明Font11chn字体,Font11chn.c需要存放于"LVGL\src\font"文件夹下 */
+LV_FONT_DECLARE(FontAIStatus)
 LV_FONT_DECLARE(Font48)
 
 extern lv_indev_t *indev_keypad;    /* 按键组 */
@@ -47,6 +48,15 @@ unsigned int  app_readly_list[32];
 uint8_t lv_trigger_bit = 0;
 static lv_obj_t *sd_toast_obj = NULL;
 static lv_timer_t *sd_toast_timer = NULL;
+static lv_point_t back_btn_press_point;
+static bool back_btn_press_active = false;
+static bool back_btn_dragged = false;
+static portMUX_TYPE app_close_request_mux = portMUX_INITIALIZER_UNLOCKED;
+static void (*app_close_requested_fn)(void) = NULL;
+static uint32_t app_sd_close_next_id = 0;
+static uint32_t app_sd_close_pending_id = 0;
+static uint32_t app_sd_close_completed_id = 0;
+static bool app_sd_close_started = false;
 
 /**
  * @brief       添加小图标的状态
@@ -138,6 +148,114 @@ static void lv_close_active_app(void)
         app_obj_general.APP_Function = NULL;
         app_obj_general.app_state = NOT_DEL_STATE;
         app_obj_general.requires_sd = 0;
+    }
+}
+
+void lv_request_active_app_close_from_task(void (*expected_close_fn)(void))
+{
+    if (expected_close_fn == NULL)
+    {
+        return;
+    }
+
+    portENTER_CRITICAL(&app_close_request_mux);
+    app_close_requested_fn = expected_close_fn;
+    portEXIT_CRITICAL(&app_close_request_mux);
+}
+
+uint32_t lv_request_sd_app_close_from_task(void)
+{
+    portENTER_CRITICAL(&app_close_request_mux);
+    app_sd_close_next_id++;
+    if (app_sd_close_next_id == 0)
+    {
+        app_sd_close_next_id = 1;
+    }
+    app_sd_close_pending_id = app_sd_close_next_id;
+    app_sd_close_started = false;
+    uint32_t request_id = app_sd_close_pending_id;
+    portEXIT_CRITICAL(&app_close_request_mux);
+    return request_id;
+}
+
+bool lv_app_close_request_complete(uint32_t request_id)
+{
+    portENTER_CRITICAL(&app_close_request_mux);
+    bool complete = request_id != 0 && app_sd_close_completed_id == request_id;
+    portEXIT_CRITICAL(&app_close_request_mux);
+    return complete;
+}
+
+static void lv_complete_sd_app_close_request(uint32_t request_id)
+{
+    portENTER_CRITICAL(&app_close_request_mux);
+    if (app_sd_close_pending_id == request_id)
+    {
+        app_sd_close_completed_id = request_id;
+        app_sd_close_pending_id = 0;
+        app_sd_close_started = false;
+    }
+    portEXIT_CRITICAL(&app_close_request_mux);
+}
+
+void lv_process_app_close_requests(void)
+{
+    void (*requested_close_fn)(void) = NULL;
+
+    portENTER_CRITICAL(&app_close_request_mux);
+    requested_close_fn = app_close_requested_fn;
+    app_close_requested_fn = NULL;
+    uint32_t sd_request_id = app_sd_close_pending_id;
+    bool sd_close_started = app_sd_close_started;
+    portEXIT_CRITICAL(&app_close_request_mux);
+
+    if (app_obj_general.del_parent != NULL &&
+        app_obj_general.app_state == DEL_STATE &&
+        app_obj_general.APP_Function != NULL)
+    {
+        lv_close_active_app();
+    }
+
+    if (requested_close_fn != NULL &&
+        app_obj_general.del_parent != NULL &&
+        app_obj_general.APP_Function == requested_close_fn)
+    {
+        lv_close_active_app();
+    }
+
+    if (sd_request_id == 0)
+    {
+        return;
+    }
+
+    if (!sd_close_started)
+    {
+        if (app_obj_general.del_parent != NULL &&
+            app_obj_general.APP_Function != NULL &&
+            app_obj_general.requires_sd)
+        {
+            lv_close_active_app();
+            portENTER_CRITICAL(&app_close_request_mux);
+            if (app_sd_close_pending_id == sd_request_id)
+            {
+                app_sd_close_started = true;
+            }
+            portEXIT_CRITICAL(&app_close_request_mux);
+            sd_close_started = true;
+        }
+        else
+        {
+            lv_complete_sd_app_close_request(sd_request_id);
+            return;
+        }
+    }
+
+    if (sd_close_started &&
+        (app_obj_general.del_parent == NULL ||
+         app_obj_general.APP_Function == NULL ||
+         !app_obj_general.requires_sd))
+    {
+        lv_complete_sd_app_close_request(sd_request_id);
     }
 }
 
@@ -318,23 +436,80 @@ static void lv_backbtn_control_event_handler(lv_event_t *event)
     lv_event_code_t code = lv_event_get_code(event);
     lv_obj_t * obj = lv_event_get_target(event);
 
-    if (code == LV_EVENT_PRESSING)
+    if (code == LV_EVENT_PRESSED)
+    {
+        lv_indev_t *indev = lv_indev_get_act();
+        back_btn_press_active = indev != NULL;
+        back_btn_dragged = false;
+        if (indev != NULL)
+        {
+            lv_indev_get_point(indev, &back_btn_press_point);
+        }
+    }
+    else if (code == LV_EVENT_PRESSING)
     {
         lv_indev_t * indev = lv_indev_get_act();
-        if(indev == NULL)  return;
+        if(indev == NULL || !back_btn_press_active)  return;
 
         lv_point_t vect;
         lv_indev_get_vect(indev, &vect);
+
+        lv_point_t current_point;
+        lv_indev_get_point(indev, &current_point);
+        lv_coord_t distance_x = current_point.x - back_btn_press_point.x;
+        lv_coord_t distance_y = current_point.y - back_btn_press_point.y;
+        if (distance_x < 0)
+        {
+            distance_x = -distance_x;
+        }
+        if (distance_y < 0)
+        {
+            distance_y = -distance_y;
+        }
+        if (distance_x >= 10 || distance_y >= 10)
+        {
+            back_btn_dragged = true;
+        }
+
         lv_coord_t x = lv_obj_get_x(obj) + vect.x;
         lv_coord_t y = lv_obj_get_y(obj) + vect.y;
+        lv_coord_t max_x = lv_obj_get_width(lv_scr_act()) - lv_obj_get_width(obj);
+        lv_coord_t max_y = lv_obj_get_height(lv_scr_act()) - lv_obj_get_height(obj);
 
-        if (x > 0 && y > 0 && x < lv_obj_get_width(lv_scr_act()) - 50 && y < lv_obj_get_height(lv_scr_act()) - 50)
+        if (x < 0)
         {
-            lv_obj_set_pos(obj, x, y);
+            x = 0;
         }
+        else if (x > max_x)
+        {
+            x = max_x;
+        }
+        if (y < 0)
+        {
+            y = 0;
+        }
+        else if (y > max_y)
+        {
+            y = max_y;
+        }
+
+        lv_obj_set_pos(obj, x, y);
+    }
+    else if (code == LV_EVENT_PRESS_LOST)
+    {
+        back_btn_press_active = false;
+        back_btn_dragged = false;
     }
     else if (code == LV_EVENT_CLICKED)
     {
+        bool should_activate = !back_btn_press_active || !back_btn_dragged;
+        back_btn_press_active = false;
+        back_btn_dragged = false;
+        if (!should_activate)
+        {
+            return;
+        }
+
         if (app_obj_general.current_parent != NULL)
         {
             if (app_obj_general.Function != NULL)
@@ -452,11 +627,6 @@ static void lv_rtc_timer(lv_timer_t* timer)
 
     //lv_label_set_text_fmt(main_ui.mini_box.time,"%02d : %02d : %02d", main_ui.rtc.hour, main_ui.rtc.minute,main_ui.rtc.second);
     lv_label_set_text_fmt(main_ui.mian_inter.mian_time_text,"%02d : %02d", main_ui.rtc.hour, main_ui.rtc.minute);
-    if (app_obj_general.del_parent != NULL && app_obj_general.app_state == DEL_STATE && app_obj_general.APP_Function != NULL)
-    {
-        lv_close_active_app();
-    }
-
     // if (lv_smail_icon_get_state(TF_STATE))
     // {
     //     lv_obj_set_style_img_recolor(main_ui.mini_box.tf,lv_color_make(0,250,0),LV_STATE_DEFAULT);
@@ -602,7 +772,7 @@ void lv_mian_ui(void)
 		{4, "视频", &lv_video},
 		{5, "文件", &l_file},
 		{6, "wifi", &l_wifi},
-		{7, "usb", &usb},
+		{7, "AI状态", &usb},
 		{8, "游戏", &game},
 	};
 
@@ -644,7 +814,7 @@ void lv_mian_ui(void)
 			lv_obj_t *app_label = lv_label_create(main_ui.mian_inter.mian_imagebg_obx);
 			lv_label_set_text(app_label, app_info[ico_num].app_text_en);
 			lv_obj_set_style_text_color(app_label,lv_color_hex(0xFFFFFF),LV_STATE_DEFAULT);
-			lv_obj_set_style_text_font(app_label, &Font11chn, 0);
+			lv_obj_set_style_text_font(app_label, ico_num == 7 ? &FontAIStatus : &Font11chn, 0);
 			lv_obj_set_style_text_align(app_label, LV_TEXT_ALIGN_CENTER, 0);
 			
 			/* 将标签对齐到图标下方中间位置 */

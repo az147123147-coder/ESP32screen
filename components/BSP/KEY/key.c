@@ -51,7 +51,7 @@ uint8_t key_scan(uint8_t mode)
 
     if (key_boot && (BOOT == 0))    /* 按键松开标志为1，且有任意一个按键按下了 */
     {
-        vTaskDelay(10);             /* 去抖动 */
+        vTaskDelay(pdMS_TO_TICKS(10));             /* 去抖动 */
         key_boot = 0;
 
         if (BOOT == 0)

@@ -497,10 +497,16 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, u
  * @param       无
  * @retval      无
  */
-void tud_usb_sd(void)
+esp_err_t tud_usb_sd(void)
 {
     const tinyusb_config_t tusb_cfg = {0};
     /* USB设备登记 */
-    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+    esp_err_t ret = tinyusb_driver_install(&tusb_cfg);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "USB MSC initialization failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
     ESP_LOGI(TAG, "USB MSC initialization DONE");
+    return ESP_OK;
 }

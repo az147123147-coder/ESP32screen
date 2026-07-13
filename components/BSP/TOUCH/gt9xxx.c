@@ -20,6 +20,11 @@ const char * gt9xxx_tag = "gt9xxx";
 i2c_master_bus_handle_t myiic1_bus_handle;     /* 总线句柄 */
 i2c_master_dev_handle_t gt9xxx_handle = NULL;
 #define GT9XXX_I2C_TIMEOUT_MS 100
+#define GT9XXX_INIT_RETRY_COUNT 3
+#define GT9XXX_INIT_RETRY_DELAY_MS 20
+#define GT9XXX_SCAN_FAILURE_THRESHOLD 3
+
+static uint8_t s_scan_failures;
 
 /* 注意: 除了GT9271支持10点触摸之外, 其他触摸芯片只支持 5点触摸 */
 uint8_t g_gt_tnum = 5;      /* 默认支持的触摸屏点数(5点触摸) */
@@ -125,10 +130,13 @@ esp_err_t gt9xxx_init(void)
         .device_address  = GT9XXX_DEV_ID,           /* 从机7位的地址 */
     };
     /* I2C总线上添加gt9xxx设备 */
-    ret = i2c_master_bus_add_device(myiic1_bus_handle, &gt9xxx_i2c_dev_conf, &gt9xxx_handle);
-    if (ret != ESP_OK)
+    if (gt9xxx_handle == NULL)
     {
-        return ret;
+        ret = i2c_master_bus_add_device(myiic1_bus_handle, &gt9xxx_i2c_dev_conf, &gt9xxx_handle);
+        if (ret != ESP_OK)
+        {
+            return ret;
+        }
     }
 
     /* 以下是对CT_RST和CT_INT引脚做配置,同时会产生的时序决定了驱动IC的器件地址为0x14(某些芯片还会有另外一种时序,会使器件地址为0x5D) */
@@ -138,19 +146,39 @@ esp_err_t gt9xxx_init(void)
     gpio_init_struct.pull_down_en = GPIO_PULLDOWN_DISABLE;          /* 失能下拉 */
     gpio_init_struct.mode         = GPIO_MODE_INPUT;                /* 输入模式 */
     gpio_init_struct.pin_bit_mask = 1ull << GT9XXX_INT_GPIO_PIN;    /* 设置的引脚的位掩码 */
-    gpio_config(&gpio_init_struct);                                 /* 配置中断引脚 */
+    ret = gpio_config(&gpio_init_struct);                           /* 配置中断引脚 */
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
 
     for (int i = 2;i > 0;i--)
     {
-        CT_RST(0);
+        ret = xl9555_pin_write(TP_RST_IO, 0);
+        if (ret != ESP_OK)
+        {
+            return ret;
+        }
         vTaskDelay(pdMS_TO_TICKS(200));
-        CT_RST(1);
+        ret = xl9555_pin_write(TP_RST_IO, 1);
+        if (ret != ESP_OK)
+        {
+            return ret;
+        }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ret = gt9xxx_rd_reg(GT9XXX_PID_REG, temp, 4);     /* 读取产品ID */
+    for (uint8_t attempt = 0; attempt < GT9XXX_INIT_RETRY_COUNT; attempt++)
+    {
+        ret = gt9xxx_rd_reg(GT9XXX_PID_REG, temp, 4);     /* 读取产品ID */
+        if (ret == ESP_OK)
+        {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(GT9XXX_INIT_RETRY_DELAY_MS));
+    }
     if (ret != ESP_OK)
     {
         return ret;
@@ -159,26 +187,46 @@ esp_err_t gt9xxx_init(void)
     /* 判断一下是否是特定的触摸屏 */
     if (strcmp((char *)temp, "911") && strcmp((char *)temp, "9147") && strcmp((char *)temp, "1158") && strcmp((char *)temp, "9271") && strcmp((char *)temp, "928"))
     {
-        return 1;   /* 若不是触摸屏用到的GT911/9147/1158/9271，则初始化失败，需硬件查看触摸IC型号以及查看时序函数是否正确 */
+        return ESP_ERR_NOT_FOUND;   /* 若不是触摸屏用到的GT911/9147/1158/9271，则初始化失败，需硬件查看触摸IC型号以及查看时序函数是否正确 */
     }
     ESP_LOGI("GT9XXX", "CTP:%s", temp);         /* 打印触摸屏驱动IC的ID */                      
-    
+
+    g_gt_tnum = 5;
     if (strcmp((char *)temp, "9271") == 0)      /* ID==9271 / ID==928, 支持10点触摸 */
     {
         g_gt_tnum = 10;                         /* 支持10点触摸屏 */
     }
 
     temp[0] = 0X02;
-    ret = gt9xxx_wr_reg(GT9XXX_CTRL_REG, temp, 1);    /* 软复位GT9XXX */
+    for (uint8_t attempt = 0; attempt < GT9XXX_INIT_RETRY_COUNT; attempt++)
+    {
+        ret = gt9xxx_wr_reg(GT9XXX_CTRL_REG, temp, 1);    /* 软复位GT9XXX */
+        if (ret == ESP_OK)
+        {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(GT9XXX_INIT_RETRY_DELAY_MS));
+    }
     if (ret != ESP_OK)
     {
         return ret;
     }
     
-    vTaskDelay(10);
+    vTaskDelay(pdMS_TO_TICKS(10));
     
     temp[0] = 0X00;
-    return gt9xxx_wr_reg(GT9XXX_CTRL_REG, temp, 1);    /* 结束复位, 进入读坐标状态 */
+    for (uint8_t attempt = 0; attempt < GT9XXX_INIT_RETRY_COUNT; attempt++)
+    {
+        ret = gt9xxx_wr_reg(GT9XXX_CTRL_REG, temp, 1);    /* 结束复位, 进入读坐标状态 */
+        if (ret == ESP_OK)
+        {
+            s_scan_failures = 0;
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(GT9XXX_INIT_RETRY_DELAY_MS));
+    }
+
+    return ret;
 }
 
 static void gt9xxx_release_touch(void)
@@ -189,6 +237,20 @@ static void gt9xxx_release_touch(void)
         tp_dev.x[i] = 0xFFFF;
         tp_dev.y[i] = 0xFFFF;
     }
+}
+
+static uint8_t gt9xxx_scan_failed(void)
+{
+    gt9xxx_release_touch();
+    if (s_scan_failures < GT9XXX_SCAN_FAILURE_THRESHOLD)
+    {
+        s_scan_failures++;
+    }
+    if (s_scan_failures >= GT9XXX_SCAN_FAILURE_THRESHOLD)
+    {
+        tp_dev.scan = NULL;
+    }
+    return 0;
 }
 
 /* GT9XXX 10个触摸点(最多) 对应的寄存器表 */
@@ -212,23 +274,30 @@ uint8_t gt9xxx_scan(uint8_t mode)
     uint8_t res = 0;
     uint16_t temp;
     uint16_t tempsta;
+    bool scanned = false;
     static uint8_t t = 0;           /* 控制查询间隔,从而降低CPU占用率 */
     t++;
 
     if ((t % 10) == 0 || t < 10)    /* 空闲时,每进入10次CTP_Scan函数才检测1次,从而节省CPU使用率 */
     {
+        scanned = true;
         if (gt9xxx_rd_reg(GT9XXX_GSTID_REG, &mode, 1) != ESP_OK)              /* 读取触摸点的状态 */
         {
-            gt9xxx_release_touch();
-            return 0;
+            return gt9xxx_scan_failed();
         }
 
-        if ((mode & 0X80) && ((mode & 0XF) <= g_gt_tnum))
+        if (mode & 0X80)
         {
             i = 0;
             if (gt9xxx_wr_reg(GT9XXX_GSTID_REG, &i, 1) != ESP_OK)             /* 清标志 */
             {
+                return gt9xxx_scan_failed();
+            }
+
+            if ((mode & 0XF) > g_gt_tnum || (mode & 0XF) > CT_MAX_TOUCH)
+            {
                 gt9xxx_release_touch();
+                s_scan_failures = 0;
                 return 0;
             }
         }
@@ -247,8 +316,7 @@ uint8_t gt9xxx_scan(uint8_t mode)
                 {
                     if (gt9xxx_rd_reg(GT9XXX_TPX_TBL[i], buf, 4) != ESP_OK)   /* 读取XY坐标值 */
                     {
-                        gt9xxx_release_touch();
-                        return 0;
+                        return gt9xxx_scan_failed();
                     }
 
                     if (lcd_dev.dir == 0)        /* 竖屏 */
@@ -308,6 +376,11 @@ uint8_t gt9xxx_scan(uint8_t mode)
     if (t > 240)
     {
         t = 10;                             /* 重新从10开始计数 */
+    }
+
+    if (scanned)
+    {
+        s_scan_failures = 0;
     }
 
     return res;

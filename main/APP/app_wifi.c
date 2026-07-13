@@ -18,9 +18,11 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "esp_rtc.h"
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -51,6 +53,7 @@ static volatile bool wifi_connect_wait_running = false;
 static volatile uint32_t wifi_scan_requested_generation = 0;
 static volatile uint32_t wifi_scan_running_generation = 0;
 static volatile uint32_t wifi_connect_wait_generation = 0;
+static volatile bool wifi_suppress_reconnect = false;
 static uint32_t wifi_conn_box_generation = 0;
 static esp_netif_t *wifi_sta_netif = NULL;
 static lv_obj_t *status_label = NULL;           /* 连接状态标签 */
@@ -147,6 +150,8 @@ static void async_update_status_label_cb(void *arg);
 static bool wifi_saved_find_password(const char *ssid, char *password, size_t password_size);
 static bool wifi_saved_remember(const char *ssid, const char *password, wifi_auth_mode_t authmode);
 static esp_err_t wifi_module_init(void);
+static void wifi_cancel_connect_wait(void);
+static bool wifi_is_hex_psk(const char *password, size_t length);
 
 /**
  * @brief       AP信息释放事件
@@ -169,6 +174,7 @@ static void conn_box_delete_event(lv_event_t *e)
 
     if (target == wifi_ui.conn_box)
     {
+        wifi_cancel_connect_wait();
         if (wifi_ui.pwd_ta != NULL && lv_obj_is_valid(wifi_ui.pwd_ta))
         {
             lv_obj_remove_event_cb(wifi_ui.pwd_ta, ta_event_cb);
@@ -578,6 +584,47 @@ static uint32_t wifi_next_connect_wait_generation(void)
     return generation;
 }
 
+static void wifi_cancel_connect_wait(void)
+{
+    if (!wifi_connect_wait_running)
+    {
+        return;
+    }
+
+    wifi_suppress_reconnect = true;
+    wifi_next_connect_wait_generation();
+    wifi_connect_wait_running = false;
+    if (wifi_event_group != NULL)
+    {
+        xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+    }
+    if (wifi_started)
+    {
+        esp_err_t ret = esp_wifi_disconnect();
+        if (ret != ESP_OK && ret != ESP_ERR_WIFI_NOT_STARTED && ret != ESP_ERR_WIFI_NOT_CONNECT)
+        {
+            ESP_LOGW(TAG, "WiFi cancel disconnect failed: %s", esp_err_to_name(ret));
+        }
+    }
+}
+
+static bool wifi_is_hex_psk(const char *password, size_t length)
+{
+    if (password == NULL || length != MAX_PASSWORD_LEN)
+    {
+        return false;
+    }
+
+    for (size_t i = 0; i < length; i++)
+    {
+        if (!isxdigit((unsigned char)password[i]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool wifi_connect_wait_is_current(const wifi_connect_wait_t *wait)
 {
     return wait != NULL &&
@@ -674,7 +721,7 @@ static void wifi_connect_wait_task(void *arg)
         .task_generation = wait->task_generation,
         .conn_box_generation = wait->conn_box_generation,
     };
-    strncpy(result_data.ssid, wait->ssid, sizeof(result_data.ssid) - 1);
+    memcpy(result_data.ssid, wait->ssid, sizeof(result_data.ssid));
     free(wait);
 
     bool result_queued = false;
@@ -735,14 +782,14 @@ static void wifi_connect_result_cb(void *arg)
         free(result);
     }
 
-    if (is_current && owns_conn_box && wifi_ui.conn_box && lv_obj_is_valid(wifi_ui.conn_box))
-    {
-        lv_msgbox_close(wifi_ui.conn_box);
-    }
-
     if (owns_wait)
     {
         wifi_connect_wait_running = false;
+    }
+
+    if (is_current && owns_conn_box && wifi_ui.conn_box && lv_obj_is_valid(wifi_ui.conn_box))
+    {
+        lv_msgbox_close(wifi_ui.conn_box);
     }
 }
 
@@ -763,6 +810,7 @@ static void wifi_connect_event(lv_event_t *e)
     /* 创建连接对话框 */
     if (wifi_ui.conn_box && lv_obj_is_valid(wifi_ui.conn_box))
     {
+        wifi_cancel_connect_wait();
         lv_msgbox_close(wifi_ui.conn_box);
     }
 
@@ -802,6 +850,7 @@ static void wifi_connect_event(lv_event_t *e)
     lv_obj_add_style(wifi_ui.pwd_ta, &ta_style, 0);
     lv_obj_set_size(wifi_ui.pwd_ta, 240, 48);
     lv_obj_align(wifi_ui.pwd_ta, LV_ALIGN_TOP_MID, 0, 50);
+    lv_textarea_set_max_length(wifi_ui.pwd_ta, MAX_PASSWORD_LEN);
     lv_textarea_set_password_mode(wifi_ui.pwd_ta, false);
 
     char saved_password[MAX_PASSWORD_LEN + 1] = {0};
@@ -855,6 +904,7 @@ static void conn_btn_event(lv_event_t *e)
     /* 检查是否点击了取消按钮 */
     if (strcmp(txt, "Connect") != 0) 
 	{            /* 非"Connect"按钮视为取消操作 */
+        wifi_cancel_connect_wait();
         lv_msgbox_close(wifi_ui.conn_box);        /* 关闭消息弹窗 */
         return;
     }
@@ -888,6 +938,23 @@ static void conn_btn_event(lv_event_t *e)
         LV_LOG_WARN("No password provided");
         return;
     }
+
+    size_t pwd_len = strnlen(pwd, MAX_PASSWORD_LEN + 1);
+    if (pwd_len > MAX_PASSWORD_LEN)
+    {
+        lv_label_set_text(lv_msgbox_get_title(wifi_ui.conn_box), "Invalid password");
+        return;
+    }
+    if (ap->authmode == WIFI_AUTH_OPEN)
+    {
+        pwd = "";
+        pwd_len = 0;
+    }
+    else if (pwd_len > MAX_PASSWORD_LEN - 1 && !wifi_is_hex_psk(pwd, pwd_len))
+    {
+        lv_label_set_text(lv_msgbox_get_title(wifi_ui.conn_box), "Invalid password");
+        return;
+    }
     
     /* 配置WiFi连接参数 */
     wifi_connect_wait_t *wait = calloc(1, sizeof(wifi_connect_wait_t));
@@ -896,8 +963,11 @@ static void conn_btn_event(lv_event_t *e)
         LV_LOG_ERROR("Connection wait malloc failed");
         return;
     }
-    strncpy(wait->ssid, (const char *)ap->ssid, sizeof(wait->ssid) - 1);
-    strncpy(wait->password, pwd, sizeof(wait->password) - 1);
+    size_t ssid_len = strnlen((const char *)ap->ssid, sizeof(wait->ssid) - 1);
+    memcpy(wait->ssid, ap->ssid, ssid_len);
+    wait->ssid[ssid_len] = '\0';
+    memcpy(wait->password, pwd, pwd_len);
+    wait->password[pwd_len] = '\0';
     wait->authmode = ap->authmode;
     wait->generation = wifi_ui_generation;
     wait->conn_box_generation = wifi_conn_box_generation;
@@ -909,19 +979,19 @@ static void conn_btn_event(lv_event_t *e)
         return;
     }
 
+    wifi_suppress_reconnect = true;
+
     wifi_config_t wifi_config = {0};
     
     /* 安全拷贝SSID（确保字符串终止符） */
-    strncpy((char*)wifi_config.sta.ssid, 
-           (char*)ap->ssid, 
-           sizeof(wifi_config.sta.ssid)-1);
-    wifi_config.sta.ssid[sizeof(wifi_config.sta.ssid)-1] = '\0'; /* 强制添加终止符 */
+    memcpy(wifi_config.sta.ssid, ap->ssid, ssid_len);
     
     /* 安全拷贝密码（确保字符串终止符） */
-    strncpy((char*)wifi_config.sta.password, 
-           pwd, 
-           sizeof(wifi_config.sta.password)-1);
-    wifi_config.sta.password[sizeof(wifi_config.sta.password)-1] = '\0';
+    memcpy(wifi_config.sta.password, pwd, pwd_len);
+    if (pwd_len < sizeof(wifi_config.sta.password))
+    {
+        wifi_config.sta.password[pwd_len] = '\0';
+    }
     
     /* 设置认证模式 */
     wifi_config.sta.threshold.authmode = ap->authmode;
@@ -965,6 +1035,7 @@ static void conn_btn_event(lv_event_t *e)
         return;
     }
 
+    wifi_suppress_reconnect = false;
     ret = esp_wifi_connect();
     if (ret != ESP_OK)
     {
@@ -1190,7 +1261,7 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
             xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
         }
 
-        if (wifi_ui_active && !wifi_connect_wait_running && wifi_started)
+        if (wifi_ui_active && !wifi_connect_wait_running && wifi_started && !wifi_suppress_reconnect)
         {
             esp_err_t ret = esp_wifi_connect();
             if (ret != ESP_OK)
@@ -1460,6 +1531,8 @@ void wifi_app_init(void)
  */
 void wifi_app_del(void) 
 {
+    wifi_suppress_reconnect = true;
+    wifi_cancel_connect_wait();
     wifi_ui_active = false;
     wifi_ui_generation++;
     wifi_scan_requested_generation = 0;

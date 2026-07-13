@@ -11,6 +11,9 @@
  */
 
  #include "spi_sd.h"
+ #include "sd_protocol_defs.h"
+
+ #define SD_STATUS_FAILURE_THRESHOLD 2
 
  sdmmc_card_t *card;                                                 /* SD / MMC卡结构 */
  const char mount_point[] = MOUNT_POINT;                             /* 挂载点/根目录 */
@@ -23,11 +26,79 @@
 
  static esp_err_t mount_ret = ESP_FAIL;
  static SemaphoreHandle_t sd_mutex = NULL;
+ static SemaphoreHandle_t sd_transaction_mutex = NULL;
  static sd_owner_t sd_owner = SD_OWNER_NONE;
  static FATFS *sd_saved_fs = NULL;
  static uint32_t sd_local_sessions = 0;
  static bool sd_local_mounted = false;
  static bool sd_recovery_required = false;
+ static uint8_t sd_status_failures = 0;
+
+ static esp_err_t sd_set_cs(bool high)
+ {
+     return xl9555_pin_write(SD_CS_IO, high ? 1 : 0);
+ }
+
+ static esp_err_t sd_spi_do_transaction(int slot, sdmmc_command_t *cmdinfo)
+ {
+     if (cmdinfo == NULL)
+     {
+         return ESP_ERR_INVALID_ARG;
+     }
+
+     if (sd_transaction_mutex == NULL)
+     {
+         return ESP_ERR_INVALID_STATE;
+     }
+
+     if (xSemaphoreTake(sd_transaction_mutex, portMAX_DELAY) != pdTRUE)
+     {
+         return ESP_ERR_TIMEOUT;
+     }
+
+     esp_err_t ret;
+     if (cmdinfo->opcode == MMC_GO_IDLE_STATE)
+     {
+         ret = sd_set_cs(true);
+         if (ret != ESP_OK)
+         {
+             xSemaphoreGive(sd_transaction_mutex);
+             return ret;
+         }
+
+         ret = my_spi_clock_bytes(10);
+         if (ret != ESP_OK)
+         {
+             xSemaphoreGive(sd_transaction_mutex);
+             return ret;
+         }
+     }
+
+     ret = sd_set_cs(false);
+     if (ret != ESP_OK)
+     {
+         sd_set_cs(true);
+         xSemaphoreGive(sd_transaction_mutex);
+         return ret;
+     }
+
+     esp_err_t transaction_ret = sdspi_host_do_transaction(slot, cmdinfo);
+     ret = sd_set_cs(true);
+     if (ret != ESP_OK)
+     {
+         xSemaphoreGive(sd_transaction_mutex);
+         return ret;
+     }
+
+     ret = my_spi_clock_bytes(1);
+     xSemaphoreGive(sd_transaction_mutex);
+     if (ret != ESP_OK)
+     {
+         return ret;
+     }
+
+     return transaction_ret;
+ }
 
  static esp_err_t sd_mutex_init(void)
  {
@@ -35,6 +106,15 @@
      {
          sd_mutex = xSemaphoreCreateRecursiveMutex();
          if (sd_mutex == NULL)
+         {
+             return ESP_ERR_NO_MEM;
+         }
+     }
+
+     if (sd_transaction_mutex == NULL)
+     {
+         sd_transaction_mutex = xSemaphoreCreateMutex();
+         if (sd_transaction_mutex == NULL)
          {
              return ESP_ERR_NO_MEM;
          }
@@ -131,9 +211,8 @@
 
          if (mount_ret == ESP_OK && card != NULL)
          {
-             SD_CS(0);
              esp_vfs_fat_sdcard_unmount(mount_point, card);
-             SD_CS(1);
+             sd_set_cs(true);
          }
 
          mount_ret = ESP_FAIL;
@@ -142,10 +221,12 @@
          sd_owner = SD_OWNER_NONE;
          sd_local_mounted = false;
          sd_recovery_required = false;
+         sd_status_failures = 0;
      }
 
      if (mount_ret == ESP_OK && card != NULL && sd_local_mounted && sd_owner == SD_OWNER_LOCAL)
      {
+         sd_status_failures = 0;
          sd_unlock();
          return ESP_OK;
      }
@@ -158,27 +239,26 @@
 
      if (mount_ret == ESP_OK && card != NULL && sd_saved_fs != NULL)
      {
-         SD_CS(0);
          FRESULT fs_result = f_mount(sd_saved_fs, "0:", 1);
-         SD_CS(1);
          if (fs_result == FR_OK)
          {
              sd_local_mounted = true;
              sd_owner = SD_OWNER_LOCAL;
              sd_recovery_required = false;
+             sd_status_failures = 0;
              sd_unlock();
              return ESP_OK;
          }
 
-         SD_CS(0);
          esp_vfs_fat_sdcard_unmount(mount_point, card);
-         SD_CS(1);
+         sd_set_cs(true);
          mount_ret = ESP_FAIL;
          card = NULL;
          sd_saved_fs = NULL;
          sd_owner = SD_OWNER_NONE;
          sd_local_mounted = false;
          sd_recovery_required = false;
+         sd_status_failures = 0;
          sd_unlock();
          return ESP_FAIL;
      }
@@ -194,6 +274,7 @@
              sd_owner = SD_OWNER_NONE;
              sd_local_mounted = false;
              sd_recovery_required = false;
+             sd_status_failures = 0;
              sd_unlock();
              return ret;
          }
@@ -206,6 +287,7 @@
      };
 
      sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+     host.do_transaction = sd_spi_do_transaction;
 
      sdspi_device_config_t slot_config = {0};
      slot_config.host_id   = host.slot;
@@ -216,9 +298,15 @@
 
      sdmmc_card_t *new_card = NULL;
 
-     SD_CS(0);
-     mount_ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &new_card);
-     SD_CS(1);
+     ret = sd_set_cs(true);
+     if (ret == ESP_OK)
+     {
+         mount_ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &new_card);
+     }
+     else
+     {
+         mount_ret = ret;
+     }
 
      if (mount_ret == ESP_OK)
      {
@@ -227,6 +315,7 @@
          sd_local_mounted = true;
          sd_saved_fs = NULL;
          sd_recovery_required = false;
+         sd_status_failures = 0;
      }
      else
      {
@@ -234,6 +323,7 @@
          sd_owner = SD_OWNER_NONE;
          sd_local_mounted = false;
          sd_recovery_required = false;
+         sd_status_failures = 0;
      }
 
      sd_unlock();
@@ -256,9 +346,7 @@
 
      if (mount_ret == ESP_OK && card != NULL)
      {
-         SD_CS(0);
          esp_vfs_fat_sdcard_unmount(mount_point, card);
-         SD_CS(1);
      }
 
      mount_ret = ESP_FAIL;
@@ -267,7 +355,8 @@
      sd_owner = SD_OWNER_NONE;
      sd_local_mounted = false;
      sd_recovery_required = false;
-     SD_CS(1);
+     sd_status_failures = 0;
+     sd_set_cs(true);
      sd_unlock();
  }
 
@@ -279,6 +368,21 @@
      }
 
      esp_err_t check_ret = sdmmc_get_status(card);
+     if (check_ret == ESP_OK)
+     {
+         sd_status_failures = 0;
+     }
+     else
+     {
+         if (sd_status_failures < SD_STATUS_FAILURE_THRESHOLD)
+         {
+             sd_status_failures++;
+         }
+         if (sd_status_failures < SD_STATUS_FAILURE_THRESHOLD)
+         {
+             check_ret = ESP_OK;
+         }
+     }
      sd_access_end();
 
      return check_ret;
@@ -297,13 +401,11 @@
          return false;
      }
 
-     SD_CS(0);
      return true;
  }
 
  void sd_access_end(void)
  {
-     SD_CS(1);
      sd_unlock();
  }
 
@@ -320,13 +422,11 @@
          return false;
      }
 
-     SD_CS(0);
      return true;
  }
 
  void sd_usb_access_end(void)
  {
-     SD_CS(1);
      sd_unlock();
  }
 
@@ -375,7 +475,6 @@
 
      DWORD free_clusters = 0;
      FATFS *fs = NULL;
-     SD_CS(0);
      FRESULT fs_result = f_getfree("0:", &free_clusters, &fs);
      if (fs_result == FR_OK && disk_ioctl(0, CTRL_SYNC, NULL) != RES_OK)
      {
@@ -385,8 +484,6 @@
      {
          fs_result = f_mount(NULL, "0:", 0);
      }
-     SD_CS(1);
-
      if (fs_result != FR_OK || fs == NULL)
      {
          sd_unlock();
@@ -396,6 +493,7 @@
      sd_saved_fs = fs;
      sd_local_mounted = false;
      sd_owner = SD_OWNER_USB;
+     sd_status_failures = 0;
      sd_unlock();
      return ESP_OK;
  }
@@ -413,23 +511,22 @@
          return ESP_OK;
      }
 
-     SD_CS(0);
      FRESULT fs_result = FR_NOT_ENABLED;
      if (sd_saved_fs != NULL && disk_ioctl(0, CTRL_SYNC, NULL) == RES_OK)
      {
          fs_result = f_mount(sd_saved_fs, "0:", 1);
      }
-     SD_CS(1);
-
      if (fs_result == FR_OK)
      {
          sd_owner = SD_OWNER_LOCAL;
          sd_local_mounted = true;
+         sd_status_failures = 0;
      }
      else
      {
          sd_owner = SD_OWNER_NONE;
          sd_local_mounted = false;
+         sd_status_failures = 0;
      }
 
      sd_unlock();

@@ -14,6 +14,7 @@
 #define __TUD_SD_H
 
 #include <inttypes.h>
+#include "esp_err.h"
 #include "ff.h"
 #include "diskio.h"
 #include "esp_vfs_fat.h"
@@ -31,6 +32,6 @@ typedef struct
 extern __usbdev g_usbdev;                   /* USB控制器 */
 
 /* 函数声明 */
-void tud_usb_sd(void);
+esp_err_t tud_usb_sd(void);
 
 #endif

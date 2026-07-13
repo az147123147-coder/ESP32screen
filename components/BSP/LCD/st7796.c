@@ -46,7 +46,7 @@
  typedef struct {
 	 esp_lcd_panel_t base;
 	 esp_lcd_panel_io_handle_t io;
-	 int reset_gpio_num;
+	 gpio_num_t reset_gpio_num;
 	 bool reset_level;
 	 int x_gap;
 	 int y_gap;
@@ -145,7 +145,6 @@
 	 return ret;
 	 ESP_COMPILER_DIAGNOSTIC_POP("-Wanalyzer-malloc-leak")
  }
- 
  static esp_err_t panel_st7796_del(esp_lcd_panel_t *panel)
  {
 	 st7796_panel_t *st7796 = __containerof(panel, st7796_panel_t, base);
@@ -157,7 +156,6 @@
 	 free(st7796);
 	 return ESP_OK;
  }
- 
  static esp_err_t panel_st7796_reset(esp_lcd_panel_t *panel)
  {
 	 st7796_panel_t *st7796 = __containerof(panel, st7796_panel_t, base);
@@ -177,7 +175,6 @@
  
 	 return ESP_OK;
  }
- 
  static esp_err_t panel_st7796_init(esp_lcd_panel_t *panel)
  {
 	 st7796_panel_t *st7796 = __containerof(panel, st7796_panel_t, base);
@@ -317,7 +314,6 @@
 	 ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, command, NULL, 0), TAG,
 						 "io tx param failed");
 	 vTaskDelay(pdMS_TO_TICKS(100));
- 
+
 	 return ESP_OK;
  }
- 

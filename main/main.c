@@ -20,7 +20,8 @@
 #include "esp_rtc.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
-#include "usart.h"
+#include "pc_ai_ble.h"
+#include "tud_sd.h"
 
 static const char *TAG = "APP_MAIN";
 
@@ -62,7 +63,12 @@ void app_main(void)
         ESP_LOGE(TAG, "I2C init failed: %s", esp_err_to_name(ret));
         return;
     }
-    my_spi_init();                      /* 初始化SPI */
+    ret = my_spi_init();                /* 初始化SPI */
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "SPI init failed: %s", esp_err_to_name(ret));
+        return;
+    }
     key_init();                         /* 初始化KEY */
     ret = xl9555_init();                /* 初始化IO扩展芯片 */
     if (ret != ESP_OK)
@@ -70,10 +76,29 @@ void app_main(void)
         ESP_LOGE(TAG, "XL9555 init failed: %s", esp_err_to_name(ret));
         return;
     }
-	usart_init(115200);                 /* 初始化串口0 */ 
     rtc_time_init();
     rtc_restore_saved_time();
-    lcd_init(lcd_config_info);          /* 初始化LCD */	
-    tud_usb_sd();                       /* 初始化USB硬件 */
-    lvgl_demo();                        /* UI界面程序入口 */
+    ret = lcd_init(lcd_config_info);    /* 初始化LCD */
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "LCD init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ret = tud_usb_sd();                 /* 初始化USB硬件 */
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "USB MSC unavailable: %s", esp_err_to_name(ret));
+    }
+    ret = lvgl_demo();                  /* UI界面程序入口 */
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "LVGL init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = pc_ai_ble_init();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "PC AI BLE init failed: %s", esp_err_to_name(ret));
+    }
 }
