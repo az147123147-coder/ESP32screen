@@ -1,21 +1,3 @@
-## 免编译烧录
-
-仓库的 `build/idf6/` 目录包含已构建好的 ESP32-S3 固件，无需安装 ESP-IDF 或重新编译即可烧录。Git 会直接跟踪下面 3 个文件，不需要复制到其他目录：
-
-| 文件 | 烧录地址 |
-| --- | ---: |
-| `build/idf6/bootloader/bootloader.bin` | `0x0` |
-| `build/idf6/partition_table/partition-table.bin` | `0x8000` |
-| `build/idf6/synthesis.bin` | `0x10000` |
-
-使用 esptool 时，在工程根目录执行：
-
-```powershell
-esptool --chip esp32s3 --before default-reset --after hard-reset write-flash --flash-mode dio --flash-size 16MB --flash-freq 80m 0x0 build/idf6/bootloader/bootloader.bin 0x8000 build/idf6/partition_table/partition-table.bin 0x10000 build/idf6/synthesis.bin
-```
-
-烧录前请关闭占用串口的程序，并选择正确的 ESP32-S3 串口；烧录完成后设备会自动复位。
-
 # ESP32-S3 3.5寸触摸屏综合工程
 
 这是一个面向 ESP32-S3 触摸屏的多功能桌面工程，集成应用启动器、图片与视频播放、计算器、日历、WiFi 时间同步，以及通过蓝牙显示 Windows 端 Codex 和 Claude 运行状态的 AI 状态面板。
@@ -27,6 +9,17 @@ esptool --chip esp32s3 --before default-reset --after hard-reset write-flash --f
 
 - 适配硬件：慧勤智远 ESP32-S3 N16R8 3.5 寸电容触摸屏开发套件
 - 商品页面：[淘宝商品链接](https://item.taobao.com/item.htm?id=946264202563)
+
+## 固件存放
+
+仓库的 `build/idf6/` 目录包含已构建好的 ESP32-S3 固件，可直接烧录。
+| 文件 | 烧录地址 |
+| --- | ---: |
+| `build/idf6/bootloader/bootloader.bin` | `0x0` |
+| `build/idf6/partition_table/partition-table.bin` | `0x8000` |
+| `build/idf6/synthesis.bin` | `0x10000` |
+
+烧录前请关闭占用串口的程序，并选择正确的 ESP32-S3 串口；烧录完成后设备会自动复位。
 
 ## 硬件
  
@@ -157,3 +150,11 @@ tools/pc_ai_ble_bridge/bin/PcAiBleBridge.exe
 - WiFi 支持扫描和连接。
 - WiFi 密码会保存到 NVS，下次连接同一热点时可复用。
 - 时间支持联网同步，并用于主界面和日历显示。
+
+# beta_1.1.2 修复说明
+
+- 修复相册首次打开缓存文件不存在时，FatFs 动态 `FIL` 未初始化导致的 invalid free 和 PANIC 重启问题。
+- 统一修复 BMP、JPEG、PNG、视频、图片管理、文件复制及 LVGL FatFs 驱动中的 `FIL` 初始化路径。
+- 修复相册缓存命中前重复读取整张原图计算 checksum 的性能问题，缓存命中改为使用文件大小、FAT 修改时间和缓存内容校验，明显加快图片打开和切换。
+- 修复 FatFs 目录长文件名写入 LVGL 缓冲区时可能越界的问题。
+- 修复 FatFs 工作区重复初始化和 SD 锁释放后访问失效文件系统指针的问题。
